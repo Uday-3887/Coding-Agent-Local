@@ -1,255 +1,309 @@
-/**
- * Central state + local persistence (IndexedDB). The store never imports the
- * agent engine — the engine imports the store — keeping the graph acyclic.
- */
 import { create } from "zustand";
-import { useEffect, useState } from "react";
-import { DEFAULT_OLLAMA_URL, OFFLINE_MODEL_ID } from "../config/app";
-import { dbDel, dbGetAll, dbPut, kvGet, kvSet } from "../lib/db";
+import { DEFAULT_OLLAMA_URL, LIMITS, OFFLINE_MODEL_ID, SECRET_PATTERNS, WELCOME_TITLE } from "../config/app";
 import { DEMO_PROJECT_LABEL, demoProjectFiles } from "../lib/demo";
-import { buildTree, pickLocalFolder, saveLocalFile } from "../lib/fs";
-import type { TreeNode } from "../lib/fs";
-import { ollamaDelete, ollamaHealth, ollamaModels, ollamaPull } from "../ai/provider";
+import { dbClear, dbDel, dbGetAll, dbPut, kvGet, kvSet } from "../lib/db";
+import { pickLocalFolder, saveLocalFile } from "../lib/fs";
 import type {
-  AgentRole, AgentState, AgentTask, AiMode, Chat, ChatMessage, Checkpoint, EditorTab,
-  FileChange, LogCategory, LogEntry, MemoryEntry, OllamaStatus, PermissionRequest,
-  Plan, Problem, RecentProject, Settings, TermLine, TermLineKind, TermSession,
-  TestRun, Toast, Workspace,
+  AdapterInfo, AgentRole, AgentState, AgentTask, Attachment, AutonomyMode, Chat, Checkpoint,
+  EditorTab, FileChange, LogCategory, LogEntry, ModelDetail, OllamaStatus, PermissionRequest,
+  Plan, PreviewState, Problem, ProjectIndex, RecentProject, ResourceInfo, ServiceInfo, Settings,
+  TaskStatus, TermLine, TermLineKind, TermSession, TestRun, Toast, Workspace, InlineEditState,
 } from "../lib/types";
+import { ollamaHealth, ollamaModels, ollamaPull, ollamaDelete } from "../ai/provider";
+import { buildIndex } from "../lib/indexer";
+import { detectProject } from "../adapters";
 
-export type SidebarView = "explorer" | "search" | "agents" | "tasks" | "git" | "settings";
-export type BottomView = "terminal" | "problems" | "output" | "tests" | "logs";
+export const ROLES: AgentRole[] = [
+  "orchestrator", "architect", "repository", "coder", "frontend", "backend",
+  "database", "tester", "debugger", "reviewer", "security", "docs",
+];
 
-let idSeq = 0;
-export const uid = (): string =>
-  `${Date.now().toString(36)}${(idSeq++).toString(36)}${Math.random().toString(36).slice(2, 7)}`;
+export type ModelRole = "chat" | "agent" | "planner" | "tester" | "reviewer" | "autocomplete";
 
-function detectShell(): string {
-  const ua = typeof navigator !== "undefined" ? navigator.userAgent : "";
-  if (/Windows/i.test(ua)) return "powershell";
-  if (/Mac/i.test(ua)) return "zsh";
-  return "bash";
-}
+const uid = () => Math.random().toString(36).slice(2, 10);
+export { uid };
 
-const defaultSettings: Settings = {
+const DEFAULT_SETTINGS: Settings = {
   theme: "dark",
   autoSave: true,
   defaultFolder: "",
   ollamaUrl: DEFAULT_OLLAMA_URL,
-  maxIterations: 6,
-  parallelAgents: false,
+  maxIterations: 12,
+  maxAgents: 2,
+  singleModelMode: false,
+  parallelAgents: true,
   autoTest: true,
   autoReview: true,
-  shell: detectShell(),
+  shell: "bash",
   confirmFileChanges: false,
   confirmAskCommands: true,
   memoryEnabled: true,
+  autocomplete: { enabled: false, delayMs: 350, contextChars: 800 },
   params: { temperature: 0.2, topP: 0.9, numCtx: 8192, numPredict: 2048, seed: 0 },
-  models: { chat: "", agent: "", planner: "", tester: "", reviewer: "" },
-  sizes: { sidebar: 264, ai: 348, bottom: 224 },
+  models: { chat: "", agent: "", planner: "", tester: "", reviewer: "", autocomplete: "" },
+  sizes: { sidebar: 264, ai: 360, bottom: 240 },
 };
 
-const ROLES: AgentRole[] = ["orchestrator", "architect", "repository", "coder", "tester", "debugger", "reviewer"];
+const DEFAULT_PREVIEW: PreviewState = {
+  doc: "", url: "", kind: "none", mode: "none", note: "",
+  device: { label: "Laptop", w: 1366, h: 768 }, zoom: 1,
+  consoleLines: [], inspectOn: false, inspectInfo: null,
+  autoRefresh: true, building: false, error: null, detectedUrls: [],
+};
 
 export const emptyAgents = (): Record<AgentRole, AgentState> => {
   const out = {} as Record<AgentRole, AgentState>;
-  for (const r of ROLES) {
-    out[r] = { role: r, status: "idle", note: "", toolCalls: [], filesTouched: [], errors: [], output: "" };
-  }
+  for (const r of ROLES) out[r] = { role: r, status: "idle", note: "", toolCalls: [], filesTouched: [], errors: [], output: "" };
   return out;
 };
+
+/** Resolve the effective model for a role: explicit > single-model mode > chat model > first Ollama model > heuristic. */
+export function resolveModel(state: Pick<AppState, "settings" | "ollama">, role: ModelRole): { model: string; useOllama: boolean } {
+  const { settings, ollama } = state;
+  const connected = ollama.status === "connected" && ollama.models.length > 0;
+  let m = settings.models[role];
+  if (settings.singleModelMode && connected) m = m || settings.models.chat || ollama.models[0];
+  if (!m && connected && (role === "chat" || !settings.models[role])) m = settings.models.chat || ollama.models[0];
+  if (!m) m = connected ? ollama.models[0] : OFFLINE_MODEL_ID;
+  return { model: m, useOllama: connected && m !== OFFLINE_MODEL_ID };
+}
+
+export type SidebarView = "explorer" | "search" | "agents" | "tasks" | "git" | "settings" | "rundev" | null;
+export type BottomView = "terminal" | "problems" | "output" | "tests" | "logs" | "services" | "api" | "database" | null;
+
+interface MemoryEntry { id: string; project: string; text: string; at: number; }
 
 export interface AppState {
   booted: boolean;
   workspace: Workspace | null;
-  tree: TreeNode[];
+  adapter: AdapterInfo | null;
+  tree: { path: string; type: "file" | "dir"; depth: number }[];
   recents: RecentProject[];
   tabs: EditorTab[];
   activeTabId: string | null;
   dirty: Record<string, string>;
   settings: Settings;
-  ollama: { status: OllamaStatus; models: string[]; version?: string };
-  sidebarView: SidebarView | null;
-  aiView: AiMode;
-  bottomView: BottomView | null;
+  ollama: { status: OllamaStatus; models: string[]; version?: string; modelDetails: ModelDetail[]; pullState: { model: string; status: string; pct?: number } | null };
+  sidebarView: SidebarView;
+  bottomView: BottomView;
+  aiView: "chat" | "agent" | "plan" | "test";
   chats: Chat[];
   activeChatId: string | null;
   streaming: boolean;
   streamText: string;
-  agents: Record<AgentRole, AgentState>;
   tasks: AgentTask[];
+  agents: Record<AgentRole, AgentState>;
   agentRunning: boolean;
+  autonomy: AutonomyMode;
   pending: FileChange[];
   checkpoints: Checkpoint[];
-  permission: PermissionRequest | null;
-  plan: Plan | null;
-  report: string | null;
   problems: Problem[];
-  testRuns: TestRun[];
   terminals: TermSession[];
   activeTerminalId: string | null;
-  output: TermLine[];
+  testRuns: TestRun[];
+  plan: Plan | null;
   logs: LogEntry[];
   toasts: Toast[];
+  permission: PermissionRequest | null;
+  output: TermLine[];
   memory: MemoryEntry[];
+  report: string | null;
   pullState: { model: string; status: string; pct?: number } | null;
   quickOpen: boolean;
   paletteOpen: boolean;
   selection: string;
+  cursorPos: { line: number; col: number };
+  services: ServiceInfo[];
+  preview: PreviewState;
+  inlineEdit: InlineEditState | null;
+  attachments: Attachment[];
+  index: ProjectIndex | null;
+  resources: ResourceInfo;
+  pullAbort: AbortController | null;
 
   boot: () => Promise<void>;
   toast: (kind: Toast["kind"], title: string, body?: string) => void;
   dismissToast: (id: string) => void;
   log: (cat: LogCategory, msg: string) => void;
-  updateSettings: (p: Partial<Settings>) => void;
-  setWorkspace: (ws: Workspace, persist?: boolean) => void;
-  openLocal: () => Promise<void>;
+  updateSettings: (patch: Partial<Settings>) => void;
+
   openDemo: () => Promise<void>;
+  openLocal: () => Promise<void>;
   openRecent: (label: string) => Promise<void>;
+  setWorkspace: (ws: Workspace | null) => void;
+
+  buildTree: () => void;
+  createFile: (path: string, content?: string) => Promise<void>;
+  createFolder: (path: string) => Promise<void>;
+  renamePath: (from: string, to: string) => Promise<void>;
+  deletePath: (path: string) => Promise<void>;
+  duplicatePath: (path: string) => Promise<void>;
   openFile: (path: string) => void;
-  openSpecialTab: (tab: EditorTab) => void;
   closeTab: (id: string) => void;
+  closeAllTabs: () => void;
   setActiveTab: (id: string) => void;
+  openSpecialTab: (tab: EditorTab) => void;
   editorChange: (path: string, value: string) => void;
   saveFile: (path: string) => Promise<void>;
-  createFile: (path: string) => void;
-  renameFile: (from: string, to: string) => void;
-  deleteFile: (path: string) => void;
+  saveAll: () => Promise<void>;
+  setCursorPos: (line: number, col: number) => void;
+
+  setSidebarView: (v: SidebarView) => void;
+  setBottomView: (v: BottomView) => void;
+  setAiView: (v: AppState["aiView"]) => void;
+  setAutonomy: (v: AutonomyMode) => void;
+
   newChat: () => string;
   renameChat: (id: string, title: string) => void;
   deleteChat: (id: string) => void;
   pinChat: (id: string) => void;
   setActiveChat: (id: string | null) => void;
-  appendChatMessage: (chatId: string, msg: ChatMessage) => void;
-  setChatMessages: (chatId: string, msgs: ChatMessage[]) => void;
-  setAiView: (v: AiMode) => void;
-  setSidebarView: (v: SidebarView | null) => void;
-  setBottomView: (v: BottomView | null) => void;
-  setQuickOpen: (b: boolean) => void;
-  setPaletteOpen: (b: boolean) => void;
-  connectOllama: (silent?: boolean) => Promise<void>;
-  disconnectOllama: () => void;
-  refreshModels: () => Promise<void>;
-  pullModel: (name: string) => Promise<void>;
-  deleteModel: (name: string) => Promise<void>;
-  setStreaming: (b: boolean) => void;
-  setStreamText: (t: string) => void;
+  appendChatMessage: (chatId: string, msg: Chat["messages"][number]) => void;
+  setChatMessages: (chatId: string, msgs: Chat["messages"]) => void;
+  setStreaming: (v: boolean) => void;
+  setStreamText: (v: string) => void;
   appendStream: (tok: string) => void;
-  setAgentState: (role: AgentRole, p: Partial<AgentState>) => void;
-  resetAgents: () => void;
+  addAttachment: (a: Attachment) => void;
+  removeAttachment: (name: string) => void;
+  setAttachments: (a: Attachment[]) => void;
+
   addTask: (t: AgentTask) => void;
-  updateTask: (id: string, p: Partial<AgentTask>) => void;
-  setAgentRunning: (b: boolean) => void;
+  updateTask: (id: string, patch: Partial<AgentTask>) => void;
+  removeTask: (id: string) => void;
+  setTaskStatus: (id: string, status: TaskStatus) => void;
+  setAgents: (a: Record<AgentRole, AgentState>) => void;
+  setAgentState: (role: AgentRole, patch: Partial<AgentState>) => void;
+  resetAgents: () => void;
+  setAgentRunning: (v: boolean) => void;
+
   addPendingChange: (c: FileChange) => void;
   acceptChange: (id: string) => Promise<void>;
   rejectChange: (id: string) => void;
-  acceptAll: () => Promise<void>;
-  rejectAll: () => void;
-  undoTask: (taskId: string) => void;
+  acceptAll: (taskId?: string) => Promise<void>;
+  rejectAll: (taskId?: string) => void;
+  undoTaskChanges: (taskId: string) => Promise<void>;
+
   addCheckpoint: (c: Checkpoint) => void;
-  restoreCheckpoint: (id: string) => void;
+  restoreCheckpoint: (id: string) => Promise<void>;
   deleteCheckpoint: (id: string) => void;
-  setPlan: (p: Plan | null) => void;
-  setReport: (r: string | null) => void;
-  addProblems: (list: Problem[]) => void;
+
+  addProblems: (p: Problem[]) => void;
   clearProblemsBySource: (source: string) => void;
-  setProblems: (list: Problem[]) => void;
-  termLine: (sessionId: string, kind: TermLineKind, text: string) => void;
-  newTerminal: () => void;
+  clearProblems: () => void;
+
+  newTerminal: () => string;
   closeTerminal: (id: string) => void;
-  clearTerminal: (id: string) => void;
   setActiveTerminal: (id: string) => void;
+  termLine: (id: string, kind: TermLineKind, text: string) => void;
+  clearTerminal: (id: string) => void;
+
+  addTestRun: (r: TestRun) => void;
+  setPlan: (p: Plan | null) => void;
   pushOutput: (kind: TermLineKind, text: string) => void;
   clearOutput: () => void;
-  addTestRun: (r: TestRun) => void;
-  setPermission: (p: PermissionRequest | null) => void;
-  resolvePermission: (allow: boolean) => void;
-  requestPermission: (cls: "ask" | "dangerous", title: string, detail: string) => Promise<boolean>;
+  setReport: (r: string | null) => void;
   memoryAdd: (text: string) => void;
-  memoryClear: () => void;
-  setPullState: (p: AppState["pullState"]) => void;
-}
+  clearMemory: () => Promise<void>;
+  requestPermission: (cls: "ask" | "dangerous", title: string, detail: string) => Promise<boolean>;
+  resolvePermission: (allow: boolean) => void;
+  setQuickOpen: (v: boolean) => void;
+  setPaletteOpen: (v: boolean) => void;
 
-const saveTimers = new Map<string, ReturnType<typeof setTimeout>>();
-let pullAbort: AbortController | null = null;
+  connectOllama: (silent?: boolean) => Promise<void>;
+  disconnectOllama: () => void;
+  refreshModels: () => Promise<void>;
+  refreshModelDetails: () => Promise<void>;
+  pullModel: (model: string) => Promise<void>;
+  deleteModel: (model: string) => Promise<void>;
+  cancelPull: () => void;
+
+  setService: (s: ServiceInfo) => void;
+  removeService: (id: string) => void;
+  setPreview: (patch: Partial<PreviewState>) => void;
+  resetPreview: () => void;
+  setInlineEdit: (v: InlineEditState | null) => void;
+  setIndex: (i: ProjectIndex | null) => void;
+  refreshResources: () => void;
+}
 
 export const useStore = create<AppState>()((set, get) => ({
   booted: false,
   workspace: null,
+  adapter: null,
   tree: [],
   recents: [],
   tabs: [],
   activeTabId: null,
   dirty: {},
-  settings: defaultSettings,
-  ollama: { status: "disconnected", models: [] },
+  settings: DEFAULT_SETTINGS,
+  ollama: { status: "disconnected", models: [], modelDetails: [], pullState: null },
   sidebarView: "explorer",
+  bottomView: null,
   aiView: "chat",
-  bottomView: "terminal",
   chats: [],
   activeChatId: null,
   streaming: false,
   streamText: "",
-  agents: emptyAgents(),
   tasks: [],
+  agents: emptyAgents(),
   agentRunning: false,
+  autonomy: "normal",
   pending: [],
   checkpoints: [],
-  permission: null,
-  plan: null,
-  report: null,
   problems: [],
+  terminals: [{ id: "term-1", name: "bash", lines: [{ kind: "sys", text: "LocalForge terminal — workspace shell emulator. Type \"help\"." }], busy: false }],
+  activeTerminalId: "term-1",
   testRuns: [],
-  terminals: [],
-  activeTerminalId: null,
-  output: [],
+  plan: null,
   logs: [],
   toasts: [],
+  permission: null,
+  output: [],
   memory: [],
+  report: null,
   pullState: null,
   quickOpen: false,
   paletteOpen: false,
   selection: "",
+  cursorPos: { line: 1, col: 1 },
+  services: [],
+  preview: DEFAULT_PREVIEW,
+  inlineEdit: null,
+  attachments: [],
+  index: null,
+  resources: { cores: navigator.hardwareConcurrency ?? 4, heapMB: null, heapLimitMB: null },
+  pullAbort: null,
 
   boot: async () => {
-    try {
-      const [settings, recents, chats, tasks, checkpoints, testRuns, memory, ws] = await Promise.all([
-        kvGet<Settings>("settings"),
-        kvGet<RecentProject[]>("recents"),
-        dbGetAll<Chat>("chats"),
-        dbGetAll<AgentTask>("tasks"),
-        dbGetAll<Checkpoint>("checkpoints"),
-        dbGetAll<TestRun>("test_runs"),
-        dbGetAll<MemoryEntry>("project_memory"),
-        kvGet<Workspace>("workspace"),
-      ]);
-      const cur = get().settings;
-      const merged: Settings = settings
-        ? {
-            ...cur, ...settings,
-            params: { ...cur.params, ...(settings.params ?? {}) },
-            models: { ...cur.models, ...(settings.models ?? {}) },
-            sizes: { ...cur.sizes, ...(settings.sizes ?? {}) },
-          }
-        : cur;
-      const term: TermSession = { id: uid(), name: "shell-1", lines: [{ kind: "sys", text: 'LocalForge workspace shell — type "help"' }], busy: false };
-      set({
-        settings: merged,
-        recents: recents ?? [],
-        chats: (chats ?? []).sort((a, b) => b.createdAt - a.createdAt),
-        tasks: (tasks ?? []).sort((a, b) => b.createdAt - a.createdAt),
-        checkpoints: (checkpoints ?? []).sort((a, b) => b.at - a.at),
-        testRuns: (testRuns ?? []).sort((a, b) => b.at - a.at),
-        memory: memory ?? [],
-        terminals: [term],
-        activeTerminalId: term.id,
-      });
-      if (ws && ws.files && Object.keys(ws.files).length > 0) get().setWorkspace(ws, false);
-      get().log("APP", "boot complete — local database mounted");
-    } catch (e) {
-      get().log("ERROR", `boot: ${(e as Error).message}`);
-    } finally {
-      set({ booted: true });
+    const settings = (await kvGet<Settings>("settings")) ?? DEFAULT_SETTINGS;
+    const merged = { ...DEFAULT_SETTINGS, ...settings, params: { ...DEFAULT_SETTINGS.params, ...settings.params }, models: { ...DEFAULT_SETTINGS.models, ...settings.models }, sizes: { ...DEFAULT_SETTINGS.sizes, ...settings.sizes }, autocomplete: { ...DEFAULT_SETTINGS.autocomplete, ...settings.autocomplete } };
+    const chats = (await dbGetAll<Chat>("chats")).sort((a, b) => b.createdAt - a.createdAt);
+    const tasks = (await dbGetAll<AgentTask>("tasks")).sort((a, b) => b.createdAt - a.createdAt).map((t) => (t.status === "running" || t.status === "queued" ? { ...t, status: "cancelled" as const } : t));
+    const checkpoints = (await dbGetAll<Checkpoint>("checkpoints")).sort((a, b) => b.at - a.at);
+    const memory = await dbGetAll<MemoryEntry>("project_memory");
+    const testRuns = (await dbGetAll<TestRun>("test_runs")).sort((a, b) => b.at - a.at).slice(0, 30);
+    const recents = (await kvGet<RecentProject[]>("recents")) ?? [];
+    const dirty = (await kvGet<Record<string, string>>("dirty-buffers")) ?? {};
+    const lastWorkspace = await kvGet<Workspace>("last-workspace");
+    document.documentElement.dataset.theme = merged.theme === "system" ? (window.matchMedia("(prefers-color-scheme: light)").matches ? "light" : "dark") : merged.theme;
+
+    set({
+      booted: true, settings: merged, chats, tasks, checkpoints, memory, testRuns, recents, dirty,
+      logs: [{ id: uid(), at: Date.now(), cat: "APP", msg: "LocalForge booted — local database mounted" }],
+    });
+    get().refreshResources();
+
+    if (lastWorkspace && lastWorkspace.source !== "local") {
+      // demo/upload workspaces restore fully; local folders re-request permission on Open Folder
+      set({ workspace: lastWorkspace, adapter: detectProject(lastWorkspace.files) });
+      get().buildTree();
+      get().log("APP", `restored workspace "${lastWorkspace.label}" (${Object.keys(lastWorkspace.files).length} files)`);
+    }
+    // restore unsaved buffers as tabs
+    const dirtyPaths = Object.keys(dirty);
+    if (dirtyPaths.length && get().workspace) {
+      for (const p of dirtyPaths.slice(0, 6)) get().openFile(p);
+      get().toast("info", "Recovered unsaved edits", `${dirtyPaths.length} buffer(s) restored from the crash-recovery store.`);
     }
     void get().connectOllama(true);
   },
@@ -257,48 +311,64 @@ export const useStore = create<AppState>()((set, get) => ({
   toast: (kind, title, body) => {
     const t: Toast = { id: uid(), kind, title, body };
     set((s) => ({ toasts: [...s.toasts.slice(-3), t] }));
-    setTimeout(() => get().dismissToast(t.id), 4600);
+    setTimeout(() => get().dismissToast(t.id), kind === "error" ? 7000 : 4500);
   },
   dismissToast: (id) => set((s) => ({ toasts: s.toasts.filter((t) => t.id !== id) })),
-
-  log: (cat, msg) =>
-    set((s) => ({ logs: [...s.logs.slice(-399), { id: uid(), at: Date.now(), cat, msg }] })),
-
-  updateSettings: (p) => {
-    const settings = { ...get().settings, ...p };
+  log: (cat, msg) => {
+    const safe = SECRET_PATTERNS.some((p) => p.test(msg)) ? "[masked]" : msg;
+    set((s) => ({ logs: [...s.logs.slice(-(LIMITS.maxSearchResults * 2)), { id: uid(), at: Date.now(), cat, msg: safe }] }));
+  },
+  updateSettings: (patch) => {
+    const settings = { ...get().settings, ...patch };
     set({ settings });
     void kvSet("settings", settings);
+    if (patch.theme) {
+      document.documentElement.dataset.theme = settings.theme === "system" ? (window.matchMedia("(prefers-color-scheme: light)").matches ? "light" : "dark") : settings.theme;
+    }
   },
 
-  setWorkspace: (ws, persist = true) => {
-    set({
-      workspace: ws, tree: buildTree(ws.files), tabs: [], activeTabId: null,
-      dirty: {}, plan: null, report: null, problems: [], pending: [],
-    });
-    const recents = [
-      { label: ws.label, source: ws.source, at: Date.now() },
-      ...get().recents.filter((r) => r.label !== ws.label),
-    ].slice(0, 8);
-    set({ recents });
-    void kvSet("recents", recents);
-    if (persist && ws.source !== "local") void kvSet("workspace", ws);
-    get().log("APP", `workspace opened: ${ws.label} · ${Object.keys(ws.files).length} files · ${ws.source}`);
+  /* ───── workspaces ───── */
+
+  setWorkspace: (ws) => {
+    set({ workspace: ws, tabs: [], activeTabId: null, dirty: {}, problems: [], plan: null, report: null, index: null, services: [], pending: [] });
+    get().resetPreview();
+    if (ws) {
+      set({ adapter: detectProject(ws.files) });
+      get().buildTree();
+      set({ index: buildIndex(ws.files) });
+      void kvSet("last-workspace", ws);
+      const recents = [{ label: ws.label, source: ws.source, at: Date.now() }, ...get().recents.filter((r) => r.label !== ws.label)].slice(0, 8);
+      set({ recents });
+      void kvSet("recents", recents);
+      void dbPut("projects", { id: ws.label, label: ws.label, source: ws.source, openedAt: ws.openedAt, fileCount: Object.keys(ws.files).length });
+      get().log("APP", `workspace "${ws.label}" opened — ${Object.keys(ws.files).length} files indexed`);
+    } else {
+      set({ adapter: null });
+      void kvSet("last-workspace", null);
+    }
+  },
+
+  openDemo: async () => {
+    const files = demoProjectFiles();
+    get().setWorkspace({ label: DEMO_PROJECT_LABEL, source: "demo", files, openedAt: Date.now() });
+    get().toast("success", "Demo workspace ready", `${Object.keys(files).length} files · React + Vite + Vitest · press Run for the live preview.`);
+    get().openFile("src/App.tsx");
   },
 
   openLocal: async () => {
     try {
       const picked = await pickLocalFolder();
       if (!picked) return;
-      get().setWorkspace({ label: picked.label, source: "local", files: picked.files, openedAt: Date.now() });
-      get().toast("success", `Opened ${picked.label}`, `${Object.keys(picked.files).length} files indexed · saves write through to disk`);
+      const { label, files } = picked;
+      if (!label) return;
+      get().setWorkspace({ label, source: "local", files, openedAt: Date.now() });
+      get().toast("success", "Folder opened", `${Object.keys(files).length} files indexed · saves write through to disk`);
+      const first = Object.keys(files).find((f) => /\.(tsx?|jsx?|py|md|json)$/.test(f));
+      if (first) get().openFile(first);
     } catch (e) {
       get().toast("error", "Could not open folder", (e as Error).message);
+      get().log("ERROR", `open folder: ${(e as Error).message}`);
     }
-  },
-
-  openDemo: async () => {
-    get().setWorkspace({ label: DEMO_PROJECT_LABEL, source: "demo", files: demoProjectFiles(), openedAt: Date.now() });
-    get().toast("success", "Demo workspace ready", "atlas-notes · React + Vite + TypeScript");
   },
 
   openRecent: async (label) => {
@@ -306,28 +376,111 @@ export const useStore = create<AppState>()((set, get) => ({
     if (!r) return;
     if (r.source === "demo") return get().openDemo();
     if (r.source === "local") {
-      get().toast("info", "Re-grant folder access", "Browser security requires picking the folder again.");
+      get().toast("info", "Re-select the folder", "Browser security requires re-granting folder access.");
       return get().openLocal();
     }
-    const ws = await kvGet<Workspace>("workspace");
-    if (ws && ws.label === label) get().setWorkspace(ws, false);
-    else return get().openLocal();
+    const ws = (await kvGet<Workspace>(`ws-${label}`));
+    if (ws) { get().setWorkspace(ws); get().toast("success", "Project restored", label); }
   },
+
+  /* ───── tree / files ───── */
+
+  buildTree: () => {
+    const ws = get().workspace;
+    if (!ws) { set({ tree: [] }); return; }
+    const dirs = new Set<string>();
+    const paths = Object.keys(ws.files).sort();
+    for (const p of paths) {
+      const parts = p.split("/");
+      for (let i = 1; i < parts.length; i++) dirs.add(parts.slice(0, i).join("/"));
+    }
+    const nodes: AppState["tree"] = [];
+    const all = new Map<string, "file" | "dir">();
+    for (const d of dirs) all.set(d, "dir");
+    for (const p of paths) all.set(p, "file");
+    const sorted = [...all.entries()].sort(([a, ta], [b, tb]) => {
+      const da = a.split("/").length, db = b.split("/").length;
+      if (da !== db) return da - db;
+      if (ta !== tb) return ta === "dir" ? -1 : 1;
+      return a.localeCompare(b);
+    });
+    for (const [path, type] of sorted) nodes.push({ path, type, depth: path.split("/").length - 1 });
+    set({ tree: nodes });
+  },
+
+  createFile: async (path, content = "") => {
+    const ws = get().workspace;
+    if (!ws || !path.trim()) return;
+    if (ws.files[path] !== undefined) { get().toast("warn", "File exists", path); return; }
+    const files = { ...ws.files, [path]: content };
+    set({ workspace: { ...ws, files } });
+    get().buildTree();
+    get().openFile(path);
+    get().log("TOOL", `create_file ${path}`);
+    if (ws.source === "local") await saveLocalFile(ws.label, path, content).catch(() => undefined);
+  },
+
+  createFolder: async (path) => {
+    const ws = get().workspace;
+    if (!ws || !path.trim()) return;
+    const marker = `${path.replace(/\/$/, "")}/.keep`;
+    if (!ws.files[marker]) {
+      set({ workspace: { ...ws, files: { ...ws.files, [marker]: "" } } });
+      get().buildTree();
+    }
+  },
+
+  renamePath: async (from, to) => {
+    const ws = get().workspace;
+    if (!ws || !to.trim() || from === to) return;
+    const files = { ...ws.files };
+    const moving = Object.keys(files).filter((p) => p === from || p.startsWith(from + "/"));
+    if (moving.length === 0) return;
+    for (const p of moving) {
+      files[to + p.slice(from.length)] = files[p];
+      delete files[p];
+    }
+    set({ workspace: { ...ws, files } });
+    get().buildTree();
+    set((s) => ({ tabs: s.tabs.map((t) => (t.path && (t.path === from || t.path.startsWith(from + "/")) ? { ...t, path: to + t.path.slice(from.length), title: (to + t.path.slice(from.length)).split("/").pop() ?? t.title } : t)) }));
+    get().toast("success", "Renamed", `${from} → ${to}`);
+  },
+
+  deletePath: async (path) => {
+    const ws = get().workspace;
+    if (!ws) return;
+    const files = { ...ws.files };
+    const removing = Object.keys(files).filter((p) => p === path || p.startsWith(path + "/"));
+    for (const p of removing) delete files[p];
+    set({ workspace: { ...ws, files } });
+    get().buildTree();
+    set((s) => ({ tabs: s.tabs.filter((t) => !t.path || !(t.path === path || t.path.startsWith(path + "/"))) }));
+    get().toast("info", "Deleted", `${removing.length} item(s)`);
+    get().log("TOOL", `delete ${path}`);
+  },
+
+  duplicatePath: async (path) => {
+    const ws = get().workspace;
+    if (!ws || ws.files[path] === undefined) return;
+    const dot = path.lastIndexOf(".");
+    const copy = dot > 0 ? `${path.slice(0, dot)}.copy${path.slice(dot)}` : `${path}.copy`;
+    await get().createFile(copy, ws.files[path]);
+  },
+
+  /* ───── tabs / editor ───── */
 
   openFile: (path) => {
     const s = get();
-    if (!s.workspace || s.workspace.files[path] === undefined) return;
-    const id = `file:${path}`;
-    if (!s.tabs.some((t) => t.id === id)) {
-      set({ tabs: [...s.tabs, { id, kind: "file", title: path.split("/").pop() ?? path, path }] });
-    }
-    set({ activeTabId: id });
+    const existing = s.tabs.find((t) => t.kind === "file" && t.path === path);
+    if (existing) { set({ activeTabId: existing.id }); return; }
+    const tab: EditorTab = { id: uid(), kind: "file", title: path.split("/").pop() ?? path, path };
+    set((st) => ({ tabs: [...st.tabs, tab], activeTabId: tab.id }));
   },
 
   openSpecialTab: (tab) => {
-    const s = get();
-    if (!s.tabs.some((t) => t.id === tab.id)) set({ tabs: [...s.tabs, tab] });
-    set({ activeTabId: tab.id });
+    const existing = get().tabs.find((t) => t.id === tab.id);
+    if (existing) { set({ activeTabId: existing.id }); return; }
+    set((s) => ({ tabs: [...s.tabs, tab], activeTabId: tab.id }));
   },
 
   closeTab: (id) => {
@@ -339,270 +492,193 @@ export const useStore = create<AppState>()((set, get) => ({
     set({ tabs, activeTabId });
   },
 
+  closeAllTabs: () => set({ tabs: [], activeTabId: null }),
   setActiveTab: (id) => set({ activeTabId: id }),
 
   editorChange: (path, value) => {
     set((s) => ({ dirty: { ...s.dirty, [path]: value } }));
-    if (get().settings.autoSave) {
-      clearTimeout(saveTimers.get(path));
-      saveTimers.set(path, setTimeout(() => void get().saveFile(path), 900));
-    }
+    if (get().settings.autoSave) void get().saveFile(path);
   },
 
   saveFile: async (path) => {
     const s = get();
-    const content = s.dirty[path];
-    if (content === undefined || !s.workspace) return;
-    const ws: Workspace = { ...s.workspace, files: { ...s.workspace.files, [path]: content } };
+    const ws = s.workspace;
+    const value = s.dirty[path];
+    if (!ws || value === undefined) return;
+    const files = { ...ws.files, [path]: value };
     const dirty = { ...s.dirty };
     delete dirty[path];
-    set({ workspace: ws, dirty, tree: buildTree(ws.files) });
+    set({ workspace: { ...ws, files }, dirty });
+    void kvSet("dirty-buffers", get().dirty);
     if (ws.source === "local") {
-      const wrote = await saveLocalFile(ws.label, path, content);
-      get().toast(wrote ? "success" : "warn", wrote ? "Saved to disk" : "Saved in session", wrote ? path : "disk write needs folder permission — reopen the folder");
+      try { await saveLocalFile(ws.label, path, value); } catch { get().toast("warn", "Disk write failed", "Saved in-session; re-grant folder access to persist."); }
     } else {
-      void kvSet("workspace", ws);
-      get().toast("success", "Saved", path);
+      void kvSet(`ws-${ws.label}`, get().workspace);
     }
     get().log("APP", `saved ${path}`);
-  },
-
-  createFile: (path) => {
-    const s = get();
-    if (!s.workspace) return;
-    const norm = path.replace(/\\/g, "/").replace(/^\/+/, "");
-    if (!norm || s.workspace.files[norm] !== undefined) {
-      get().toast("error", "Cannot create file", !norm ? "empty path" : `${norm} already exists`);
-      return;
+    // live preview auto-refresh hook
+    if (get().preview.autoRefresh && get().preview.mode !== "none" && get().preview.mode !== "console") {
+      window.dispatchEvent(new CustomEvent("localforge-files-changed"));
     }
-    const ws = { ...s.workspace, files: { ...s.workspace.files, [norm]: "" } };
-    set({ workspace: ws, tree: buildTree(ws.files) });
-    if (ws.source !== "local") void kvSet("workspace", ws);
-    get().openFile(norm);
-    get().toast("success", "Created", norm);
+    // keep the index warm (debounced via microtask scheduling in caller)
   },
 
-  renameFile: (from, to) => {
-    const s = get();
-    if (!s.workspace || s.workspace.files[from] === undefined) return;
-    const norm = to.replace(/\\/g, "/").replace(/^\/+/, "");
-    if (!norm || s.workspace.files[norm] !== undefined) {
-      get().toast("error", "Cannot rename", !norm ? "empty path" : `${norm} already exists`);
-      return;
-    }
-    const files = { ...s.workspace.files };
-    files[norm] = files[from];
-    delete files[from];
-    const ws = { ...s.workspace, files };
-    set({ workspace: ws, tree: buildTree(files), tabs: s.tabs.filter((t) => t.path !== from), activeTabId: null });
-    if (ws.source !== "local") void kvSet("workspace", ws);
-    get().toast("success", "Renamed", `${from} → ${norm}`);
+  saveAll: async () => {
+    const paths = Object.keys(get().dirty);
+    for (const p of paths) await get().saveFile(p);
+    if (paths.length) get().toast("success", "Saved", `${paths.length} file(s)`);
   },
 
-  deleteFile: (path) => {
-    const s = get();
-    if (!s.workspace || s.workspace.files[path] === undefined) return;
-    const files = { ...s.workspace.files };
-    delete files[path];
-    const ws = { ...s.workspace, files };
-    set({ workspace: ws, tree: buildTree(files), tabs: s.tabs.filter((t) => t.path !== path) });
-    if (ws.source !== "local") void kvSet("workspace", ws);
-    get().toast("info", "Deleted", path);
+  setCursorPos: (line, col) => set({ cursorPos: { line, col } }),
+
+  setSidebarView: (v) => set({ sidebarView: v }),
+  setBottomView: (v) => set({ bottomView: v }),
+  setAiView: (v) => set({ aiView: v }),
+  setAutonomy: (v) => {
+    set({ autonomy: v });
+    get().toast("info", `Autonomy: ${v}`, v === "plan" ? "Agents cannot modify files or run mutating commands." : v === "auto" ? "Safe edits and builds run without asking; dangerous commands still require approval." : undefined);
   },
+
+  /* ───── chats ───── */
 
   newChat: () => {
-    const c: Chat = {
-      id: uid(), project: get().workspace?.label ?? "no-project", title: "New chat",
-      pinned: false, createdAt: Date.now(), messages: [],
-    };
-    set((s) => ({ chats: [c, ...s.chats], activeChatId: c.id }));
-    void dbPut("chats", c as unknown as { id: string } & Record<string, unknown>);
-    return c.id;
+    const id = uid();
+    const chat: Chat = { id, project: get().workspace?.label ?? "no-project", title: "New chat", pinned: false, createdAt: Date.now(), messages: [] };
+    set((s) => ({ chats: [chat, ...s.chats], activeChatId: id }));
+    void dbPut("chats", chat as unknown as { id: string } & Record<string, unknown>);
+    return id;
   },
-
   renameChat: (id, title) => {
     set((s) => ({ chats: s.chats.map((c) => (c.id === id ? { ...c, title } : c)) }));
     const c = get().chats.find((x) => x.id === id);
     if (c) void dbPut("chats", c as unknown as { id: string } & Record<string, unknown>);
   },
-
   deleteChat: (id) => {
-    set((s) => ({
-      chats: s.chats.filter((c) => c.id !== id),
-      activeChatId: s.activeChatId === id ? null : s.activeChatId,
-    }));
+    set((s) => ({ chats: s.chats.filter((c) => c.id !== id), activeChatId: s.activeChatId === id ? null : s.activeChatId }));
     void dbDel("chats", id);
   },
-
   pinChat: (id) => {
     set((s) => ({ chats: s.chats.map((c) => (c.id === id ? { ...c, pinned: !c.pinned } : c)) }));
     const c = get().chats.find((x) => x.id === id);
     if (c) void dbPut("chats", c as unknown as { id: string } & Record<string, unknown>);
   },
-
   setActiveChat: (id) => set({ activeChatId: id }),
-
   appendChatMessage: (chatId, msg) => {
     set((s) => ({ chats: s.chats.map((c) => (c.id === chatId ? { ...c, messages: [...c.messages, msg] } : c)) }));
     const c = get().chats.find((x) => x.id === chatId);
     if (c) void dbPut("chats", c as unknown as { id: string } & Record<string, unknown>);
   },
-
   setChatMessages: (chatId, msgs) => {
     set((s) => ({ chats: s.chats.map((c) => (c.id === chatId ? { ...c, messages: msgs } : c)) }));
     const c = get().chats.find((x) => x.id === chatId);
     if (c) void dbPut("chats", c as unknown as { id: string } & Record<string, unknown>);
   },
-
-  setAiView: (v) => set({ aiView: v }),
-  setSidebarView: (v) => set({ sidebarView: v }),
-  setBottomView: (v) => set({ bottomView: v }),
-  setQuickOpen: (b) => set({ quickOpen: b }),
-  setPaletteOpen: (b) => set({ paletteOpen: b }),
-
-  connectOllama: async (silent = false) => {
-    const url = get().settings.ollamaUrl;
-    set((s) => ({ ollama: { ...s.ollama, status: "connecting" } }));
-    const h = await ollamaHealth(url);
-    if (h.ok) {
-      const models = await ollamaModels(url).catch(() => [] as string[]);
-      set({ ollama: { status: "connected", models, version: h.version } });
-      get().log("OLLAMA", `connected ${url} · v${h.version ?? "?"} · ${models.length} model(s)`);
-      if (!silent) get().toast("success", "Ollama connected", `${models.length} model(s) available`);
-    } else {
-      set({ ollama: { status: "error", models: [] } });
-      get().log("OLLAMA", `connect failed: ${h.error}`);
-      if (!silent) get().toast("error", "Ollama unreachable", h.error ?? "Is `ollama serve` running?");
-    }
-  },
-
-  disconnectOllama: () => {
-    set({ ollama: { status: "disconnected", models: [] } });
-    get().log("OLLAMA", "disconnected by user");
-    get().toast("info", "Ollama disconnected", "The heuristic engine remains available.");
-  },
-
-  refreshModels: async () => {
-    if (get().ollama.status !== "connected") return;
-    const models = await ollamaModels(get().settings.ollamaUrl).catch(() => [] as string[]);
-    set((s) => ({ ollama: { ...s.ollama, models } }));
-    get().toast("info", "Models refreshed", `${models.length} installed`);
-  },
-
-  pullModel: async (name) => {
-    pullAbort = new AbortController();
-    set({ pullState: { model: name, status: "starting…" } });
-    try {
-      await ollamaPull(
-        get().settings.ollamaUrl, name,
-        (p) => set({ pullState: { model: name, status: p.status, pct: p.pct } }),
-        pullAbort.signal
-      );
-      get().toast("success", "Model pulled", name);
-      await get().refreshModels();
-    } catch (e) {
-      if ((e as Error).name !== "AbortError") get().toast("error", "Pull failed", (e as Error).message);
-    } finally {
-      set({ pullState: null });
-    }
-  },
-
-  deleteModel: async (name) => {
-    const allowed = await get().requestPermission("dangerous", `ollama delete ${name}`, "This removes the model from your local Ollama installation. This cannot be undone without re-pulling.");
-    if (!allowed) return;
-    try {
-      await ollamaDelete(get().settings.ollamaUrl, name);
-      get().toast("success", "Model deleted", name);
-      await get().refreshModels();
-    } catch (e) {
-      get().toast("error", "Delete failed", (e as Error).message);
-    }
-  },
-
-  setStreaming: (b) => set({ streaming: b }),
-  setStreamText: (t) => set({ streamText: t }),
+  setStreaming: (v) => set({ streaming: v }),
+  setStreamText: (v) => set({ streamText: v }),
   appendStream: (tok) => set((s) => ({ streamText: s.streamText + tok })),
+  addAttachment: (a) => set((s) => ({ attachments: [...s.attachments.filter((x) => x.name !== a.name), a] })),
+  removeAttachment: (name) => set((s) => ({ attachments: s.attachments.filter((a) => a.name !== name) })),
+  setAttachments: (a) => set({ attachments: a }),
 
-  setAgentState: (role, p) =>
-    set((s) => ({ agents: { ...s.agents, [role]: { ...s.agents[role], ...p } } })),
-
-  resetAgents: () => set({ agents: emptyAgents() }),
+  /* ───── tasks / agents ───── */
 
   addTask: (t) => {
-    set((s) => ({ tasks: [t, ...s.tasks].slice(0, 40) }));
+    set((s) => ({ tasks: [t, ...s.tasks] }));
     void dbPut("tasks", t as unknown as { id: string } & Record<string, unknown>);
   },
-
-  updateTask: (id, p) => {
-    set((s) => ({ tasks: s.tasks.map((t) => (t.id === id ? { ...t, ...p } : t)) }));
+  updateTask: (id, patch) => {
+    set((s) => ({ tasks: s.tasks.map((t) => (t.id === id ? { ...t, ...patch } : t)) }));
     const t = get().tasks.find((x) => x.id === id);
     if (t) void dbPut("tasks", t as unknown as { id: string } & Record<string, unknown>);
   },
+  removeTask: (id) => {
+    set((s) => ({ tasks: s.tasks.filter((t) => t.id !== id) }));
+    void dbDel("tasks", id);
+  },
+  setTaskStatus: (id, status) => get().updateTask(id, { status }),
+  setAgents: (a) => set({ agents: a }),
+  setAgentState: (role, patch) => set((s) => ({ agents: { ...s.agents, [role]: { ...s.agents[role], ...patch } } })),
+  resetAgents: () => set({ agents: emptyAgents() }),
+  setAgentRunning: (v) => set({ agentRunning: v }),
 
-  setAgentRunning: (b) => set({ agentRunning: b }),
+  /* ───── changes / checkpoints ───── */
 
   addPendingChange: (c) => {
-    set((s) => ({
-      pending: [...s.pending.filter((x) => !(x.taskId === c.taskId && x.path === c.path)), c],
-    }));
+    set((s) => {
+      const replaced = s.pending.filter((p) => !(p.path === c.path && p.status === "pending" && p.taskId === c.taskId));
+      return { pending: [...replaced, c] };
+    });
+    void dbPut("file_changes", c as unknown as { id: string } & Record<string, unknown>);
   },
 
   acceptChange: async (id) => {
     const s = get();
     const c = s.pending.find((x) => x.id === id);
-    if (!c || !s.workspace) return;
-    const files = { ...s.workspace.files };
+    const ws = s.workspace;
+    if (!c || !ws) return;
+    if (s.settings.confirmFileChanges) {
+      const ok = await s.requestPermission("ask", `Apply change to ${c.path}`, `${c.type} · ${c.before.length} → ${c.after.length} chars`);
+      if (!ok) return;
+    }
+    const files = { ...ws.files };
     if (c.type === "delete") delete files[c.path];
     else files[c.path] = c.after;
-    const dirty = { ...s.dirty };
-    delete dirty[c.path];
-    const ws = { ...s.workspace, files };
-    set({ workspace: ws, tree: buildTree(files), dirty, pending: s.pending.filter((x) => x.id !== id) });
-    if (ws.source === "local") await saveLocalFile(ws.label, c.path, c.after);
-    else void kvSet("workspace", ws);
-    get().toast("success", c.type === "delete" ? "Deletion applied" : "Change applied", c.path);
-    get().log("APP", `accepted ${c.type} ${c.path}`);
+    set((st) => ({ workspace: { ...ws, files }, pending: st.pending.map((x) => (x.id === id ? { ...x, status: "accepted" as const } : x)) }));
+    get().buildTree();
+    if (ws.source === "local" && c.type !== "delete") await saveLocalFile(ws.label, c.path, c.after).catch(() => undefined);
+    get().log("TOOL", `accepted ${c.type} ${c.path}`);
+    get().toast("success", "Change applied", c.path);
+    window.dispatchEvent(new CustomEvent("localforge-files-changed"));
   },
 
   rejectChange: (id) => {
-    const c = get().pending.find((x) => x.id === id);
-    set((s) => ({ pending: s.pending.filter((x) => x.id !== id) }));
-    if (c) get().toast("info", "Change rejected", c.path);
+    set((s) => ({ pending: s.pending.map((x) => (x.id === id ? { ...x, status: "rejected" as const } : x)).filter((x) => x.status === "pending") }));
+    get().log("TOOL", `rejected change ${id}`);
   },
 
-  acceptAll: async () => {
-    const ids = get().pending.map((c) => c.id);
+  acceptAll: async (taskId) => {
+    const ids = get().pending.filter((c) => c.status === "pending" && (!taskId || c.taskId === taskId)).map((c) => c.id);
     for (const id of ids) await get().acceptChange(id);
-    if (ids.length) get().toast("success", "All changes applied", `${ids.length} file(s)`);
   },
 
-  rejectAll: () => {
-    const n = get().pending.length;
-    set({ pending: [] });
-    if (n) get().toast("info", "All changes rejected", `${n} file(s) rolled back`);
+  rejectAll: (taskId) => {
+    set((s) => ({ pending: s.pending.filter((c) => c.status !== "pending" || (taskId ? c.taskId !== taskId : false)) }));
+    get().toast("info", "Changes rejected", taskId ?? undefined);
   },
 
-  undoTask: (taskId) => {
-    const n = get().pending.filter((c) => c.taskId === taskId).length;
-    set((s) => ({ pending: s.pending.filter((c) => c.taskId !== taskId) }));
-    get().toast("info", "Task changes rolled back", `${n} pending change(s) discarded`);
-    get().log("AGENT", `undo task ${taskId} — ${n} changes discarded`);
+  undoTaskChanges: async (taskId) => {
+    const s = get();
+    const ws = s.workspace;
+    if (!ws) return;
+    const applied = s.pending.filter((c) => c.taskId === taskId && c.status === "accepted");
+    const files = { ...ws.files };
+    for (const c of applied) {
+      if (c.type === "delete" || c.type === "modify") files[c.path] = c.before;
+      else delete files[c.path];
+    }
+    set({ workspace: { ...ws, files }, pending: s.pending.filter((c) => c.taskId !== taskId) });
+    get().buildTree();
+    get().toast("success", "Rolled back", `${applied.length} change(s) from ${taskId} reverted`);
+    get().log("TOOL", `undo task ${taskId} (${applied.length} changes)`);
+    window.dispatchEvent(new CustomEvent("localforge-files-changed"));
   },
 
   addCheckpoint: (c) => {
     set((s) => ({ checkpoints: [c, ...s.checkpoints].slice(0, 12) }));
     void dbPut("checkpoints", c as unknown as { id: string } & Record<string, unknown>);
+    get().log("APP", `checkpoint: ${c.label}`);
   },
 
-  restoreCheckpoint: (id) => {
-    const cp = get().checkpoints.find((c) => c.id === id);
+  restoreCheckpoint: async (id) => {
+    const c = get().checkpoints.find((x) => x.id === id);
     const ws = get().workspace;
-    if (!cp || !ws) return;
-    const next: Workspace = { ...ws, files: { ...cp.files } };
-    set({ workspace: next, tree: buildTree(next.files), dirty: {}, pending: [] });
-    if (ws.source !== "local") void kvSet("workspace", next);
-    get().toast("success", "Checkpoint restored", cp.label);
-    get().log("APP", `restored checkpoint: ${cp.label}`);
+    if (!c || !ws) return;
+    set({ workspace: { ...ws, files: { ...c.files } } });
+    get().buildTree();
+    set({ index: buildIndex(c.files) });
+    get().toast("success", "Checkpoint restored", c.label);
+    get().log("APP", `restored checkpoint ${c.label}`);
+    window.dispatchEvent(new CustomEvent("localforge-files-changed"));
   },
 
   deleteCheckpoint: (id) => {
@@ -610,128 +686,184 @@ export const useStore = create<AppState>()((set, get) => ({
     void dbDel("checkpoints", id);
   },
 
-  setPlan: (p) => set({ plan: p }),
-  setReport: (r) => set({ report: r }),
+  /* ───── problems / terminal / tests ───── */
 
-  addProblems: (list) =>
-    set((s) => {
-      const seen = new Set(s.problems.map((p) => `${p.file}:${p.line}:${p.message}`));
-      const merged = [...s.problems];
-      for (const p of list) {
-        const key = `${p.file}:${p.line}:${p.message}`;
-        if (!seen.has(key)) { merged.push(p); seen.add(key); }
-      }
-      return { problems: merged.slice(-200) };
-    }),
-
-  clearProblemsBySource: (source) =>
-    set((s) => ({ problems: s.problems.filter((p) => p.source !== source) })),
-
-  setProblems: (list) => set({ problems: list.slice(-200) }),
-
-  termLine: (sessionId, kind, text) =>
-    set((s) => ({
-      terminals: s.terminals.map((t) =>
-        t.id === sessionId
-          ? { ...t, lines: text === "__CLEAR__" ? [] : [...t.lines.slice(-799), { kind, text }] }
-          : t
-      ),
-    })),
+  addProblems: (p) => set((s) => ({ problems: [...s.problems, ...p].slice(-200) })),
+  clearProblemsBySource: (source) => set((s) => ({ problems: s.problems.filter((p) => p.source !== source) })),
+  clearProblems: () => set({ problems: [] }),
 
   newTerminal: () => {
+    const id = `term-${uid()}`;
     const n = get().terminals.length + 1;
-    const t: TermSession = { id: uid(), name: `shell-${n}`, lines: [{ kind: "sys", text: 'LocalForge workspace shell — type "help"' }], busy: false };
-    set((s) => ({ terminals: [...s.terminals, t], activeTerminalId: t.id }));
+    const session: TermSession = { id, name: `${get().settings.shell} ${n}`, lines: [{ kind: "sys", text: "LocalForge terminal — type \"help\"." }], busy: false };
+    set((s) => ({ terminals: [...s.terminals, session], activeTerminalId: id }));
+    return id;
   },
-
   closeTerminal: (id) => {
-    const rest = get().terminals.filter((t) => t.id !== id);
-    if (rest.length === 0) return get().newTerminal();
-    set({ terminals: rest, activeTerminalId: rest[0].id });
+    set((s) => {
+      const terminals = s.terminals.filter((t) => t.id !== id);
+      if (terminals.length === 0) {
+        const fresh: TermSession = { id: `term-${uid()}`, name: get().settings.shell, lines: [], busy: false };
+        return { terminals: [fresh], activeTerminalId: fresh.id };
+      }
+      return { terminals, activeTerminalId: s.activeTerminalId === id ? terminals[0].id : s.activeTerminalId };
+    });
   },
-
-  clearTerminal: (id) =>
-    set((s) => ({ terminals: s.terminals.map((t) => (t.id === id ? { ...t, lines: [] } : t)) })),
-
   setActiveTerminal: (id) => set({ activeTerminalId: id }),
-
-  pushOutput: (kind, text) =>
-    set((s) => ({ output: [...s.output.slice(-399), { kind, text }] })),
-  clearOutput: () => set({ output: [] }),
+  termLine: (id, kind, text) => {
+    set((s) => ({
+      terminals: s.terminals.map((t) => (t.id === id ? { ...t, lines: [...t.lines.slice(-LIMITS.maxTerminalLines), { kind, text }] } : t)),
+    }));
+  },
+  clearTerminal: (id) => set((s) => ({ terminals: s.terminals.map((t) => (t.id === id ? { ...t, lines: [] } : t)) })),
 
   addTestRun: (r) => {
     set((s) => ({ testRuns: [r, ...s.testRuns].slice(0, 30) }));
     void dbPut("test_runs", r as unknown as { id: string } & Record<string, unknown>);
   },
+  setPlan: (p) => set({ plan: p }),
+  pushOutput: (kind, text) => set((s) => ({ output: [...s.output.slice(-400), { kind, text }] })),
+  clearOutput: () => set({ output: [] }),
+  setReport: (r) => set({ report: r }),
 
-  setPermission: (p) => set({ permission: p }),
-
-  resolvePermission: (allow) => {
-    const p = get().permission;
-    if (p) p.resolve(allow);
-    set({ permission: null });
+  memoryAdd: (text) => {
+    if (!get().settings.memoryEnabled) return;
+    const m: MemoryEntry = { id: uid(), project: get().workspace?.label ?? "", text, at: Date.now() };
+    set((s) => ({ memory: [m, ...s.memory].slice(0, 80) }));
+    void dbPut("project_memory", m as unknown as { id: string } & Record<string, unknown>);
+  },
+  clearMemory: async () => {
+    set({ memory: [] });
+    await dbClear("project_memory");
+    get().toast("info", "Memory cleared");
   },
 
   requestPermission: (cls, title, detail) =>
     new Promise<boolean>((resolve) => {
-      set({
-        permission: { id: uid(), kind: "command", class: cls, title, detail, resolve },
-      });
+      set({ permission: { id: uid(), kind: "command", class: cls, title, detail, resolve } });
     }),
-
-  memoryAdd: (text) => {
-    if (!get().settings.memoryEnabled) return;
-    const e: MemoryEntry = { id: uid(), text, at: Date.now() };
-    set((s) => ({ memory: [e, ...s.memory].slice(0, 60) }));
-    void dbPut("project_memory", e as unknown as { id: string } & Record<string, unknown>);
+  resolvePermission: (allow) => {
+    const p = get().permission;
+    if (!p) return;
+    set({ permission: null });
+    p.resolve(allow);
+    get().log("APP", `permission ${allow ? "granted" : "denied"}: ${p.title}`);
   },
 
-  memoryClear: () => {
-    set({ memory: [] });
-    void (async () => {
-      const all = await dbGetAll<MemoryEntry>("project_memory");
-      for (const e of all) await dbDel("project_memory", e.id);
-    })();
-    get().toast("info", "Project memory cleared");
+  setQuickOpen: (v) => set({ quickOpen: v }),
+  setPaletteOpen: (v) => set({ paletteOpen: v }),
+
+  /* ───── ollama ───── */
+
+  connectOllama: async (silent = false) => {
+    const url = get().settings.ollamaUrl;
+    set((s) => ({ ollama: { ...s.ollama, status: "connecting" } }));
+    const h = await ollamaHealth(url);
+    if (h.ok) {
+      const models = await ollamaModels(url);
+      set((s) => ({ ollama: { ...s.ollama, status: "connected", version: h.version, models } }));
+      get().log("OLLAMA", `connected ${url} · ${models.length} models · v${h.version}`);
+      if (!silent) get().toast("success", "Ollama connected", `${models.length} model(s) available`);
+      void get().refreshModelDetails();
+    } else {
+      set((s) => ({ ollama: { ...s.ollama, status: "error", models: [] } }));
+      get().log("OLLAMA", `connection failed: ${h.error}`);
+      if (!silent) get().toast("warn", "Ollama unreachable", `${h.error} — the heuristic engine stays active. Install/start Ollama, then retry.`);
+    }
+  },
+  disconnectOllama: () => {
+    set((s) => ({ ollama: { ...s.ollama, status: "disconnected", models: [], modelDetails: [] } }));
+    get().toast("info", "Ollama disconnected", "Falling back to the heuristic engine.");
+  },
+  refreshModels: async () => {
+    const url = get().settings.ollamaUrl;
+    try {
+      const models = await ollamaModels(url);
+      set((s) => ({ ollama: { ...s.ollama, models, status: "connected" } }));
+      get().toast("success", "Models refreshed", `${models.length} found`);
+      void get().refreshModelDetails();
+    } catch (e) {
+      get().toast("error", "Refresh failed", (e as Error).message);
+    }
+  },
+  refreshModelDetails: async () => {
+    const s = get();
+    const details: ModelDetail[] = [];
+    for (const m of s.ollama.models.slice(0, 12)) {
+      try {
+        const res = await fetch(`${s.settings.ollamaUrl.replace(/\/$/, "")}/api/show`, { method: "POST", body: JSON.stringify({ name: m }) });
+        if (res.ok) {
+          const j = (await res.json()) as { details?: { family?: string; parameter_size?: string }; model_info?: Record<string, unknown> };
+          const ctx = Object.entries(j.model_info ?? {}).find(([k]) => k.includes("context_length"))?.[1];
+          details.push({ name: m, family: j.details?.family, size: j.details?.parameter_size, context: typeof ctx === "number" ? ctx : undefined, vision: /vision|llava|gemma3|bakllava|minicpm-v/i.test(m) || JSON.stringify(j.model_info ?? {}).includes("projector") });
+        }
+      } catch { /* detail optional */ }
+    }
+    set((st) => ({ ollama: { ...st.ollama, modelDetails: details } }));
+  },
+  pullModel: async (model) => {
+    const ctrl = new AbortController();
+    set({ pullAbort: ctrl, pullState: { model, status: "starting…" } });
+    get().log("OLLAMA", `pull ${model}`);
+    try {
+      await ollamaPull(get().settings.ollamaUrl, model, (p) => set({ pullState: { model, status: p.status, pct: p.pct } }), ctrl.signal);
+      set({ pullState: null, pullAbort: null });
+      get().toast("success", "Model pulled", model);
+      void get().refreshModels();
+    } catch (e) {
+      set({ pullState: null, pullAbort: null });
+      if ((e as Error).name !== "AbortError") get().toast("error", "Pull failed", (e as Error).message);
+    }
+  },
+  cancelPull: () => {
+    get().pullAbort?.abort();
+    set({ pullState: null, pullAbort: null });
+  },
+  deleteModel: async (model) => {
+    try {
+      await ollamaDelete(get().settings.ollamaUrl, model);
+      get().toast("success", "Model deleted", model);
+      void get().refreshModels();
+    } catch (e) {
+      get().toast("error", "Delete failed", (e as Error).message);
+    }
   },
 
-  setPullState: (p) => set({ pullState: p }),
+  /* ───── services / preview / inline / index ───── */
+
+  setService: (svc) => {
+    set((s) => {
+      const exists = s.services.some((x) => x.id === svc.id);
+      return { services: exists ? s.services.map((x) => (x.id === svc.id ? svc : x)) : [...s.services, svc] };
+    });
+  },
+  removeService: (id) => set((s) => ({ services: s.services.filter((x) => x.id !== id) })),
+  setPreview: (patch) => set((s) => ({ preview: { ...s.preview, ...patch } })),
+  resetPreview: () => set({ preview: DEFAULT_PREVIEW }),
+  setInlineEdit: (v) => set({ inlineEdit: v }),
+  setIndex: (i) => set({ index: i }),
+  refreshResources: () => {
+    const mem = (performance as unknown as { memory?: { usedJSHeapSize: number; jsHeapSizeLimit: number } }).memory;
+    set({
+      resources: {
+        cores: navigator.hardwareConcurrency ?? 4,
+        heapMB: mem ? Math.round(mem.usedJSHeapSize / 1048576) : null,
+        heapLimitMB: mem ? Math.round(mem.jsHeapSizeLimit / 1048576) : null,
+      },
+    });
+  },
 }));
 
-/* ─────────────── selectors & helpers ─────────────── */
-
+/* merged workspace view (accepted = workspace; pending = before snapshot) */
 export function getMergedFiles(s: Pick<AppState, "workspace" | "dirty">): Record<string, string> {
-  if (!s.workspace) return {};
-  return { ...s.workspace.files, ...s.dirty };
-}
-
-export type ModelRole = "chat" | "agent" | "planner" | "tester" | "reviewer";
-
-/** Resolve the effective model for a role: explicit pick → first Ollama model → heuristic. */
-export function resolveModel(
-  s: Pick<AppState, "settings" | "ollama">,
-  role: ModelRole
-): { model: string; useOllama: boolean } {
-  const chosen = s.settings.models[role];
-  if (chosen === OFFLINE_MODEL_ID) return { model: OFFLINE_MODEL_ID, useOllama: false };
-  if (s.ollama.status === "connected" && s.ollama.models.length > 0) {
-    if (chosen && s.ollama.models.includes(chosen)) return { model: chosen, useOllama: true };
-    return { model: s.ollama.models[0], useOllama: true };
-  }
-  return { model: OFFLINE_MODEL_ID, useOllama: false };
+  return { ...(s.workspace?.files ?? {}), ...s.dirty };
 }
 
 export function useResolvedTheme(): "dark" | "light" {
   const theme = useStore((s) => s.settings.theme);
-  const [sys, setSys] = useState<"dark" | "light">(() =>
-    typeof window !== "undefined" && window.matchMedia?.("(prefers-color-scheme: light)").matches ? "light" : "dark"
-  );
-  useEffect(() => {
-    const mq = window.matchMedia?.("(prefers-color-scheme: light)");
-    if (!mq) return;
-    const h = (e: MediaQueryListEvent) => setSys(e.matches ? "light" : "dark");
-    mq.addEventListener?.("change", h);
-    return () => mq.removeEventListener?.("change", h);
-  }, []);
-  return theme === "system" ? sys : theme;
+  if (theme !== "system") return theme;
+  return window.matchMedia("(prefers-color-scheme: light)").matches ? "light" : "dark";
 }
+
+export { WELCOME_TITLE };
+export type { MemoryEntry };

@@ -16,7 +16,7 @@ export interface ModelParams {
   seed: number;
 }
 
-export interface ProviderChatMessage { role: "system" | "user" | "assistant"; content: string; }
+export interface ProviderChatMessage { role: "system" | "user" | "assistant"; content: string; images?: string[]; }
 
 export interface StreamChatOptions {
   model: string;
@@ -221,8 +221,12 @@ export class OfflineProvider implements AIProvider {
   readonly label = "LocalForge Heuristic (built-in)";
 
   async streamChat(opts: StreamChatOptions): Promise<string> {
-    const lastUser = [...opts.messages].reverse().find((m) => m.role === "user")?.content ?? "";
-    const answer = offlineChatAnswer(lastUser, opts.files ?? {}, opts.facts ?? ({} as ProjectFacts), opts.extraFile ?? null);
+    const lastUser = [...opts.messages].reverse().find((m) => m.role === "user") ?? { content: "" };
+    const hasImages = opts.messages.some((m) => m.images?.length);
+    const imageNote = hasImages
+      ? "**Image attachments received.** The built-in heuristic engine cannot analyze images — connect Ollama and select a vision model (e.g. `llava`, `gemma3`, `minicpm-v`) to use screenshot context.\n\n"
+      : "";
+    const answer = imageNote + offlineChatAnswer(lastUser.content, opts.files ?? {}, opts.facts ?? ({} as ProjectFacts), opts.extraFile ?? null);
     const words = answer.split(/(\s+)/);
     let full = "";
     for (const w of words) {

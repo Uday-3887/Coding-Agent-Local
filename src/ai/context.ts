@@ -1,10 +1,11 @@
 import { LIMITS } from "../config/app";
-import { isSecretFile, maskSecretContent } from "../lib/fs";
+import { isSecretFile } from "../lib/fs";
 import type { Problem, ProjectFacts } from "../lib/types";
 
 const EXT_LANG: Record<string, string> = {
   ts: "TypeScript", tsx: "TypeScript React", js: "JavaScript", jsx: "JavaScript React",
   json: "JSON", md: "Markdown", html: "HTML", css: "CSS", py: "Python", yml: "YAML", yaml: "YAML",
+  java: "Java", cs: "C#", go: "Go", rs: "Rust", php: "PHP", rb: "Ruby", sql: "SQL",
 };
 
 /** Real, computed facts about the workspace — the backbone of every prompt. */
@@ -26,19 +27,26 @@ export function computeFacts(files: Record<string, string>): ProjectFacts {
   else if (allDeps["express"]) framework = "Express (Node.js)";
   else if (allDeps["fastify"]) framework = "Fastify (Node.js)";
   else if (files["pyproject.toml"] || files["requirements.txt"]) framework = "Python";
+  else if (files["Cargo.toml"]) framework = "Rust";
+  else if (files["go.mod"]) framework = "Go";
+  else if (files["pom.xml"] || files["build.gradle"]) framework = "Java";
 
   let packageManager = "npm";
   if (files["pnpm-lock.yaml"]) packageManager = "pnpm";
   else if (files["yarn.lock"]) packageManager = "yarn";
   else if (files["bun.lockb"] || files["bun.lock"]) packageManager = "bun";
   else if (files["pyproject.toml"] || files["requirements.txt"]) packageManager = "pip";
+  else if (files["Cargo.toml"]) packageManager = "cargo";
+  else if (files["go.mod"]) packageManager = "go modules";
 
   let testFramework = "none detected";
   if (allDeps["vitest"]) testFramework = "Vitest";
   else if (allDeps["jest"]) testFramework = "Jest";
   else if (allDeps["@playwright/test"]) testFramework = "Playwright";
   else if (allDeps["cypress"]) testFramework = "Cypress";
-  else if (files["pytest.ini"] || /pytest/.test(files["pyproject.toml"] ?? "")) testFramework = "pytest";
+  else if (files["pytest.ini"] || /pytest/.test(files["pyproject.toml"] ?? "") || /pytest/.test(files["requirements.txt"] ?? "")) testFramework = "pytest";
+  else if (files["Cargo.toml"]) testFramework = "cargo test";
+  else if (files["go.mod"]) testFramework = "go test";
 
   const langCount = new Map<string, number>();
   for (const p of paths) {
@@ -81,10 +89,10 @@ export function factsToText(facts: ProjectFacts): string {
 
 export interface Mention { type: string; arg: string; }
 
-/** Parse @file / @folder / @project / @selection / @errors / @terminal / @git references. */
+/** Parse @file / @folder / @project / @codebase / @selection / @errors / @terminal / @git / @diff / @tests / @docs references. */
 export function parseMentions(input: string): Mention[] {
   const out: Mention[] = [];
-  const re = /@(file|folder|project|selection|errors|terminal|git)(?:\s+([^\s@]+))?/g;
+  const re = /@(file|folder|project|codebase|selection|errors|terminal|git|diff|tests|docs)(?:\s+([^\s@]+))?/g;
   let m: RegExpExecArray | null;
   while ((m = re.exec(input)) !== null) out.push({ type: m[1], arg: m[2] ?? "" });
   return out;
@@ -99,37 +107,46 @@ export interface ContextRequest {
   problems?: Problem[];
   terminalTail?: string;
   gitSummary?: string;
+  diffText?: string;
+  testsSummary?: string;
+  docsSummary?: string;
+  codebaseSummary?: string;
   extraFiles?: string[];
   budget?: number;
 }
 
 /**
- * Context Manager: decides which files/snippets enter the prompt, masks secrets,
- * and enforces a hard character budget. Never dumps the whole repository.
+ * Context Manager with priority budgeting:
+ *   1. selection  2. referenced files  3. current file  4. related symbols (via extraFiles)
+ *   5. search results  6. recent changes (diff)  7. terminal errors  8. architecture summary
+ * Secrets are masked; the whole repo is never dumped.
  */
 export function buildContext(req: ContextRequest): { text: string; included: string[]; masked: string[] } {
   const budget = req.budget ?? LIMITS.maxContextChars;
-  const parts: string[] = [factsToText(req.facts)];
+  const parts: string[] = [];
   const included: string[] = [];
   const masked: string[] = [];
-  let used = parts[0].length;
+  let used = 0;
+
+  const add = (chunk: string) => {
+    if (used + chunk.length > budget) return false;
+    parts.push(chunk);
+    used += chunk.length;
+    return true;
+  };
 
   const addFile = (path: string, label: string) => {
     if (included.includes(path)) return;
-    const raw = req.files[path];
-    if (raw === undefined) return;
-    let content = raw;
-    if (isSecretFile(path)) {
-      content = maskSecretContent(raw);
-      masked.push(path);
-    }
-    const snippet = `\n<file path="${path}" note="${label}${isSecretFile(path) ? " · SECRETS MASKED" : ""}">\n${content.slice(0, 6000)}\n</file>`;
-    if (used + snippet.length > budget) return;
-    parts.push(snippet);
-    included.push(path);
-    used += snippet.length;
+    const content = req.files[path];
+    if (content === undefined) return;
+    if (isSecretFile(path)) { masked.push(path); return; }
+    const snippet = `\n<file path="${path}" note="${label}">\n${content.slice(0, 6000)}\n</file>`;
+    if (add(snippet)) included.push(path);
   };
 
+  // 1. user selection
+  if (req.selection) add(`<selected_code>\n${req.selection.slice(0, 3000)}\n</selected_code>`);
+  // 2. explicitly referenced files
   for (const m of req.mentions) {
     if (m.type === "file" && m.arg) addFile(m.arg, "explicitly referenced");
     if (m.type === "folder" && m.arg) {
@@ -137,23 +154,21 @@ export function buildContext(req: ContextRequest): { text: string; included: str
     }
   }
   for (const p of req.extraFiles ?? []) addFile(p, "task-relevant");
+  // 3. current file
   if (req.activeFile) addFile(req.activeFile, "active in editor");
-
-  if (req.selection && used + req.selection.length < budget) {
-    parts.push(`\n<selected_code>\n${req.selection.slice(0, 3000)}\n</selected_code>`);
-    used += req.selection.length;
-  }
+  // 6. recent changes
+  if (req.diffText) add(`<recent_changes>\n${req.diffText.slice(0, 4000)}\n</recent_changes>`);
+  // 7. terminal + errors
+  if (req.mentions.some((m) => m.type === "terminal") && req.terminalTail) add(`<terminal_tail>\n${req.terminalTail.slice(-2500)}\n</terminal_tail>`);
   if (req.mentions.some((m) => m.type === "errors") && req.problems?.length) {
-    const p = `\n<current_problems>\n${req.problems.slice(0, 25).map((x) => `${x.severity} ${x.file}:${x.line} ${x.message}`).join("\n")}\n</current_problems>`;
-    parts.push(p);
+    add(`<current_problems>\n${req.problems.slice(0, 25).map((x) => `${x.severity} ${x.file}:${x.line} ${x.message}`).join("\n")}\n</current_problems>`);
   }
-  if (req.mentions.some((m) => m.type === "terminal") && req.terminalTail) {
-    parts.push(`\n<terminal_tail>\n${req.terminalTail.slice(-2500)}\n</terminal_tail>`);
-  }
-  if (req.mentions.some((m) => m.type === "git") && req.gitSummary) {
-    parts.push(`\n<source_control_state>\n${req.gitSummary}\n</source_control_state>`);
-  }
-
+  if (req.mentions.some((m) => m.type === "git") && req.gitSummary) add(`<source_control_state>\n${req.gitSummary}\n</source_control_state>`);
+  if (req.testsSummary) add(`<test_results>\n${req.testsSummary}\n</test_results>`);
+  if (req.docsSummary) add(`<project_docs>\n${req.docsSummary}\n</project_docs>`);
+  // 8. architecture summary + facts (always fit — they are small)
+  if (req.codebaseSummary) add(`<architecture_summary>\n${req.codebaseSummary}\n</architecture_summary>`);
+  add(factsToText(req.facts));
   const tree = Object.keys(req.files).sort().join("\n");
   if (used + tree.length < budget) parts.unshift(`File tree:\n${tree}`);
 

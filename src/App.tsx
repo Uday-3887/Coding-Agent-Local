@@ -1,14 +1,25 @@
-import React, { useCallback, useEffect, useRef } from "react";
+import React, { useCallback, useEffect, useRef, useState } from "react";
 import { stopGeneration } from "./agents/engine";
 import AIPanel from "./components/AIPanel";
 import BottomPanel from "./components/BottomPanel";
 import EditorArea from "./components/EditorArea";
 import { CommandPalette, PermissionModal, QuickOpen, ToastHost } from "./components/Overlays";
+import SetupWizard from "./components/SetupWizard";
 import Sidebar from "./components/Sidebar";
 import StatusBar from "./components/StatusBar";
 import TopBar from "./components/TopBar";
 import { LogoMark, Spinner } from "./components/ui";
 import { useResolvedTheme, useStore } from "./state/store";
+
+/** First launch after install (or ?setup=1 from the Electron installer) → wizard opens. */
+function setupRequested(): boolean {
+  try {
+    if (window.location.search.includes("setup")) return true;
+    return localStorage.getItem("lf-setup-done") !== "1";
+  } catch {
+    return false;
+  }
+}
 
 /* ─────────────── error boundary ─────────────── */
 
@@ -109,11 +120,24 @@ function Shell() {
   const sidebarView = useStore((s) => s.sidebarView);
   const bottomView = useStore((s) => s.bottomView);
   const sizes = useStore((s) => s.settings.sizes);
+  const [setupOpen, setSetupOpen] = useState(setupRequested);
   useHotkeys();
   useThemeApplier();
 
   useEffect(() => {
     void useStore.getState().boot();
+  }, []);
+
+  // "Setup Wizard" command from the palette / welcome screen.
+  useEffect(() => {
+    const open = () => setSetupOpen(true);
+    window.addEventListener("lf-open-setup", open);
+    return () => window.removeEventListener("lf-open-setup", open);
+  }, []);
+
+  const closeSetup = useCallback(() => {
+    try { localStorage.setItem("lf-setup-done", "1"); } catch { /* private mode */ }
+    setSetupOpen(false);
   }, []);
 
   const sidebar = useResize("sidebar");
@@ -166,6 +190,7 @@ function Shell() {
       <PermissionModal />
       <CommandPalette />
       <QuickOpen />
+      {setupOpen && <SetupWizard onDone={closeSetup} />}
     </div>
   );
 }

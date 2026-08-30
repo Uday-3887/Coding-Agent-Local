@@ -91,6 +91,7 @@ export function CommandPalette() {
       { id: "scm", label: "Open Source Control", run: () => st.setSidebarView("git") },
       { id: "settings", label: "Open Settings", run: () => st.setSidebarView("settings") },
       { id: "preview", label: "Open Preview", hint: "live website", run: () => void openPreview() },
+      { id: "setup", label: "Setup Wizard (Configure)", hint: "ollama · models · prefs", run: () => window.dispatchEvent(new Event("lf-open-setup")) },
       { id: "stop", label: "Stop All", hint: "Esc", run: stopEverything },
       { id: "quick", label: "Quick Open File", hint: "Ctrl P", run: () => st.setQuickOpen(true) },
     ];

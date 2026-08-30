@@ -1,0 +1,56 @@
+# ─────────────────────────────────────────────────────────────
+#  LocalForge AI — one-click NSIS installer definition.
+#  electron-builder picks this file up automatically.
+#  Output: dist-installer/LocalForge AI Setup 0.1.0.exe
+# ─────────────────────────────────────────────────────────────
+appId: ai.localforge.app
+productName: LocalForge AI
+copyright: Local-first · Private by design
+
+directories:
+  output: dist-installer
+  buildResources: desktop
+
+# The make-installer script sets package.json "main": "desktop/main.cjs" at build time.
+files:
+  - dist/**/*
+  - desktop/**/*
+  - package.json
+  - "!node_modules/**/*"
+
+asar: true
+
+# Ship the detailed guide inside the install folder.
+extraResources:
+  - from: README-INSTALLER.md
+    to: README-INSTALLER.md
+
+win:
+  target:
+    - target: nsis
+      arch:
+        - x64
+  artifactName: "LocalForge-AI-Setup-${version}.${ext}"
+
+nsis:
+  oneClick: true                 # ← single-click install, no wizard pages
+  perMachine: false              # installs per-user (no admin prompt)
+  allowElevation: true
+  createDesktopShortcut: true
+  createStartMenuShortcut: true
+  shortcutName: LocalForge AI
+  runAfterFinish: true           # ← app launches right after install → setup wizard opens
+  deleteAppDataOnUninstall: false
+  unicode: true
+
+linux:
+  target:
+    - AppImage
+  category: Development
+  artifactName: "LocalForge-AI-${version}.${ext}"
+
+mac:
+  target:
+    - dmg
+  category: public.app-category.developer-tools
+  artifactName: "LocalForge-AI-${version}.${ext}"

@@ -60,6 +60,13 @@ pnpm dev            # start the dev server
 pnpm build          # production build (dist/)
 ```
 
+## Windows installer (.exe) — one click
+
+Double-click **`make-installer.bat`** → it builds everything and produces
+`dist-installer\LocalForge-AI-Setup-0.1.0.exe` — a single-click NSIS installer that
+auto-launches the app and opens the **5-step configuration wizard** (Ollama URL,
+models, theme, autonomy, autocomplete). Full guide: **[`README-INSTALLER.md`](./README-INSTALLER.md)**.
+
 ## Ollama setup
 
 1. Install Ollama and start it (`ollama serve` → `http://localhost:11434`).

@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useState } from "react";
 import { AlertOctagon, AlertTriangle, CheckCircle2, Command, Info, Search, ShieldAlert, X } from "lucide-react";
-import { analyzeProject, buildProject, runProject, stopGeneration, testProject } from "../agents/engine";
+import { analyzeProject, buildProject, openPreview, runProject, stopEverything, testProject } from "../agents/engine";
 import { fuzzyFilter } from "../lib/fuzzy";
 import { getMergedFiles, useStore } from "../state/store";
 import { FileGlyph, Kbd } from "./ui";
@@ -90,7 +90,8 @@ export function CommandPalette() {
       { id: "sidebar", label: "Toggle Sidebar", hint: "Ctrl B", run: () => st.setSidebarView(st.sidebarView ? null : "explorer") },
       { id: "scm", label: "Open Source Control", run: () => st.setSidebarView("git") },
       { id: "settings", label: "Open Settings", run: () => st.setSidebarView("settings") },
-      { id: "stop", label: "Stop Generation", hint: "Esc", run: stopGeneration },
+      { id: "preview", label: "Open Preview", hint: "live website", run: () => void openPreview() },
+      { id: "stop", label: "Stop All", hint: "Esc", run: stopEverything },
       { id: "quick", label: "Quick Open File", hint: "Ctrl P", run: () => st.setQuickOpen(true) },
     ];
   }, [open]);

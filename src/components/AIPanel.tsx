@@ -1,43 +1,31 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import {
-  ArrowUp, AtSign, Check, ChevronDown, Compass, FlaskConical, History, Pin, Plus,
-  RotateCcw, Send, Square, Trash2, Wand2, X, Zap,
+  AtSign, Check, FlaskConical, ImagePlus, Paperclip, Pencil, Pin, Play, RefreshCw, Send, Square, Trash2, Wand2, X, Zap,
 } from "lucide-react";
-import { fixWithAI, regenerateLast, runAgentTask, runTestSuite, sendChat, stopGeneration } from "../agents/engine";
-import { approvePlan, generatePlan, rejectPlan, sendPlanToAgent } from "../agents/planner";
 import { OFFLINE_MODEL_ID } from "../config/app";
+import { approvePlan, generatePlan, rejectPlan, sendPlanToAgent } from "../agents/planner";
+import { regenerateLast, runTestSuite, sendChat, submitAgentTask, fixWithAI } from "../agents/engine";
 import type { TestKind } from "../lib/types";
 import { getMergedFiles, resolveModel, useStore } from "../state/store";
-import { Dropdown, Markdown, MenuItem, ROLE_META, SectionLabel, Spinner, StatusGlyph, timeAgo } from "./ui";
+import { AGENT_META, AgentStatusIcon, Markdown, SectionLabel, Spinner, timeAgo } from "./ui";
 
-function ModelTag() {
-  const aiView = useStore((s) => s.aiView);
-  const role = aiView === "plan" ? "planner" : aiView === "test" ? "tester" : aiView === "agent" ? "agent" : "chat";
-  const settings = useStore((s) => s.settings);
-  const ollama = useStore((s) => s.ollama);
-  const resolved = resolveModel({ settings, ollama }, role);
-  const label = resolved.model === OFFLINE_MODEL_ID ? "heuristic" : resolved.model;
-  return (
-    <span className="chip !text-[10px] mr-1" title={`Model used by ${role} mode`} style={{ color: resolved.useOllama ? "var(--ok)" : "var(--warn)", borderColor: "currentColor" }}>
-      <span className={`led ${resolved.useOllama ? "led-ok" : "led-warn"}`} style={{ width: 6, height: 6 }} />
-      {label.length > 22 ? label.slice(0, 20) + "…" : label}
-    </span>
-  );
-}
+const MENTIONS = ["file", "folder", "project", "codebase", "selection", "errors", "terminal", "git", "diff", "tests", "docs"];
 
 export default function AIPanel() {
   const aiView = useStore((s) => s.aiView);
   return (
-    <div className="flex flex-col h-full bg-[var(--bg1)] border-l border-[var(--line)] min-w-0">
-      <div className="flex items-center h-[34px] flex-none px-3 border-b border-[var(--line)]">
+    <div className="flex flex-col h-full bg-[var(--bg1)] border-l border-[var(--line)]">
+      <div className="flex items-center px-2.5 h-[34px] flex-none border-b border-[var(--line)] gap-1">
         <ModelTag />
-        <span className="font-display text-[11px] font-semibold uppercase tracking-[0.14em] text-[var(--tx2)]">
-          {aiView === "chat" ? "AI Chat" : aiView === "agent" ? "Agent Crew" : aiView === "plan" ? "Plan Mode" : "Testing"}
-        </span>
-        <div className="flex-1" />
-        {aiView === "chat" && <ChatMenu />}
+        {(["chat", "agent", "plan", "test"] as const).map((v) => (
+          <button key={v} className="px-2 py-[4px] rounded-md text-[11.5px] font-medium font-display tracking-wide capitalize transition-all"
+            style={aiView === v ? { color: "var(--ember)", background: "var(--ember-soft)" } : { color: "var(--tx3)" }}
+            onClick={() => useStore.getState().setAiView(v)}>
+            {v}
+          </button>
+        ))}
       </div>
-      <div className="flex-1 min-h-0 flex flex-col">
+      <div className="flex-1 min-h-0">
         {aiView === "chat" && <ChatView />}
         {aiView === "agent" && <AgentView />}
         {aiView === "plan" && <PlanView />}
@@ -47,277 +35,254 @@ export default function AIPanel() {
   );
 }
 
-/* ─────────────── Chat ─────────────── */
-
-function ChatMenu() {
-  const chats = useStore((s) => s.chats);
-  const activeChatId = useStore((s) => s.activeChatId);
-  const setActiveChat = useStore((s) => s.setActiveChat);
-  const newChat = useStore((s) => s.newChat);
-  const deleteChat = useStore((s) => s.deleteChat);
-  const pinChat = useStore((s) => s.pinChat);
-  const renameChat = useStore((s) => s.renameChat);
-  const workspace = useStore((s) => s.workspace);
-
-  const projectChats = useMemo(
-    () => chats.filter((c) => c.project === (workspace?.label ?? "no-project"))
-      .sort((a, b) => Number(b.pinned) - Number(a.pinned) || b.createdAt - a.createdAt),
-    [chats, workspace]
-  );
-
+function ModelTag() {
+  const aiView = useStore((s) => s.aiView);
+  const role = aiView === "plan" ? "planner" : aiView === "test" ? "tester" : aiView === "agent" ? "agent" : "chat";
+  const resolved = useStore((s) => resolveModel(s, role));
+  const label = resolved.model === OFFLINE_MODEL_ID ? "heuristic" : resolved.model;
   return (
-    <Dropdown
-      align="right"
-      width={250}
-      trigger={<button className="p-1 rounded hover:bg-[var(--bg3)] text-[var(--tx3)] hover:text-[var(--tx)]" title="Chat history"><History size={14} /></button>}
-    >
-      {(close) => (
-        <>
-          <MenuItem onClick={() => { newChat(); close(); }}><Plus size={13} /> New chat</MenuItem>
-          <div className="my-1 border-t border-[var(--line)]" />
-          {projectChats.length === 0 && <div className="px-2.5 py-2 text-[11px] text-[var(--tx3)]">No chats for this project yet.</div>}
-          {projectChats.map((c) => (
-            <div key={c.id} className="group flex items-center gap-1 rounded-md hover:bg-[var(--bg3)] transition-colors" style={c.id === activeChatId ? { background: "var(--ember-soft)" } : undefined}>
-              <button className="flex-1 min-w-0 text-left px-2.5 py-[6px]" onClick={() => { setActiveChat(c.id); close(); }}>
-                <span className="block text-[11.5px] truncate" style={c.id === activeChatId ? { color: "var(--ember)" } : undefined}>
-                  {c.pinned && <Pin size={9} className="inline mr-1" />}{c.title}
-                </span>
-                <span className="block text-[9.5px] text-[var(--tx3)]">{c.messages.length} msg · {timeAgo(c.createdAt)}</span>
-              </button>
-              <span className="hidden group-hover:flex items-center pr-1">
-                <button className="p-1 text-[var(--tx3)] hover:text-[var(--ember)]" title="Pin" onClick={() => pinChat(c.id)}><Pin size={10} /></button>
-                <button className="p-1 text-[var(--tx3)] hover:text-[var(--info)]" title="Rename"
-                  onClick={() => { const t = window.prompt("Rename chat:", c.title); if (t) renameChat(c.id, t); }}><Wand2 size={10} /></button>
-                <button className="p-1 text-[var(--tx3)] hover:text-[var(--danger)]" title="Delete" onClick={() => deleteChat(c.id)}><Trash2 size={10} /></button>
-              </span>
-            </div>
-          ))}
-        </>
-      )}
-    </Dropdown>
+    <span className="chip !text-[9.5px] mr-auto" title={`Model used by ${role} mode`} style={{ color: resolved.useOllama ? "var(--ok)" : "var(--warn)", borderColor: "currentColor" }}>
+      <span className={`led ${resolved.useOllama ? "led-ok" : "led-warn"}`} style={{ width: 6, height: 6 }} />
+      {label.length > 18 ? label.slice(0, 17) + "…" : label}
+    </span>
   );
 }
 
-const MENTIONS = ["@file", "@project", "@errors", "@terminal", "@selection", "@git"];
+/* ─────────────── Chat ─────────────── */
 
 function ChatView() {
   const chats = useStore((s) => s.chats);
   const activeChatId = useStore((s) => s.activeChatId);
   const streaming = useStore((s) => s.streaming);
   const streamText = useStore((s) => s.streamText);
-  const workspace = useStore((s) => s.workspace);
+  const attachments = useStore((s) => s.attachments);
   const [input, setInput] = useState("");
+  const [listOpen, setListOpen] = useState(false);
+  const fileRef = useRef<HTMLInputElement>(null);
   const scrollRef = useRef<HTMLDivElement>(null);
-  const taRef = useRef<HTMLTextAreaElement>(null);
 
-  const chat = chats.find((c) => c.id === activeChatId) ?? null;
-  const msgs = chat?.messages ?? [];
+  const chat = chats.find((c) => c.id === activeChatId);
+  const project = useStore.getState().workspace?.label ?? "no-project";
+  const projectChats = chats.filter((c) => c.project === project);
 
-  useEffect(() => {
-    if (scrollRef.current) scrollRef.current.scrollTop = scrollRef.current.scrollHeight;
-  }, [msgs.length, streamText]);
+  useEffect(() => { if (scrollRef.current) scrollRef.current.scrollTop = scrollRef.current.scrollHeight; }, [chat?.messages.length, streamText]);
 
-  const submit = () => {
-    if (!input.trim() || streaming) return;
-    const text = input;
+  const send = () => {
+    const t = input.trim();
+    if (!t || streaming) return;
     setInput("");
-    void sendChat(text);
+    void sendChat(t);
+  };
+
+  const attach = (f: File) => {
+    if (f.size > 1_500_000) { useStore.getState().toast("warn", "Image too large", "Keep screenshots under 1.5 MB."); return; }
+    const reader = new FileReader();
+    reader.onload = () => useStore.getState().addAttachment({ name: f.name, dataUrl: String(reader.result), size: f.size });
+    reader.readAsDataURL(f);
   };
 
   return (
-    <>
-      <div ref={scrollRef} className="flex-1 overflow-y-auto scroll-thin px-3 py-3 space-y-3">
-        {msgs.length === 0 && !streaming && (
-          <div className="pt-6 anim-fade-up">
-            <div className="flex items-center gap-2 mb-2">
-              <Compass size={16} style={{ color: "var(--ember)" }} />
-              <span className="font-display font-semibold text-[14px]">Ask about your code</span>
+    <div className="flex flex-col h-full">
+      <div className="flex items-center gap-1 px-2.5 h-[28px] border-b border-[var(--line)] flex-none">
+        <button className="chip !py-0 cursor-pointer" onClick={() => setListOpen(!listOpen)}><AtSign size={9} /> chats · {projectChats.length}</button>
+        <div className="flex-1" />
+        <button className="p-1 rounded hover:bg-[var(--bg3)] text-[var(--tx3)] hover:text-[var(--tx)]" title="New chat" onClick={() => useStore.getState().newChat()}><Pencil size={11} /></button>
+      </div>
+      {listOpen && (
+        <div className="border-b border-[var(--line)] max-h-[140px] overflow-y-auto scroll-thin anim-fade">
+          {projectChats.sort((a, b) => Number(b.pinned) - Number(a.pinned) || b.createdAt - a.createdAt).map((c) => (
+            <div key={c.id} className="flex items-center gap-1.5 px-2.5 py-[5px] hover:bg-[var(--bg3)] cursor-pointer" onClick={() => { useStore.setState({ activeChatId: c.id }); setListOpen(false); }}>
+              {c.pinned && <Pin size={9} style={{ color: "var(--ember)" }} />}
+              <span className={`text-[11px] truncate flex-1 ${c.id === activeChatId ? "text-[var(--ember)]" : ""}`}>{c.title}</span>
+              <button className="p-0.5 text-[var(--tx3)] hover:text-[var(--tx)]" onClick={(e) => { e.stopPropagation(); useStore.getState().pinChat(c.id); }}><Pin size={9} /></button>
+              <button className="p-0.5 text-[var(--tx3)] hover:text-[var(--danger)]" onClick={(e) => { e.stopPropagation(); useStore.getState().deleteChat(c.id); }}><Trash2 size={9} /></button>
             </div>
-            <p className="text-[11.5px] text-[var(--tx3)] leading-relaxed mb-3">
-              {workspace ? `Context is drawn from ${workspace.label} — reference anything with @mentions.` : "Open a project to ground answers in real code."}
-            </p>
-            <div className="space-y-1.5">
-              {["explain the architecture", "find bugs in this project", "how do I run this project?", `@file ${Object.keys(getMergedFiles(useStore.getState())).find((p) => p.startsWith("src/") && p.endsWith(".tsx")) ?? "README.md"} explain this component`].map((sugg) => (
-                <button key={sugg} className="block w-full text-left px-2.5 py-1.5 rounded-lg raised text-[11.5px] text-[var(--tx2)] hover:text-[var(--tx)] hover:border-[var(--ember)] transition-all"
-                  onClick={() => { setInput(sugg); taRef.current?.focus(); }}>
-                  {sugg}
-                </button>
+          ))}
+          {projectChats.length === 0 && <p className="px-3 py-2 text-[10.5px] text-[var(--tx3)]">No chats for this project yet.</p>}
+        </div>
+      )}
+
+      <div ref={scrollRef} className="flex-1 overflow-y-auto scroll-thin px-3 py-3 space-y-3">
+        {!chat || chat.messages.length === 0 ? (
+          <div className="text-center pt-8 space-y-2 anim-fade">
+            <p className="font-display text-[13px] font-semibold">Ask about this project</p>
+            <p className="text-[11px] text-[var(--tx3)] max-w-[260px] mx-auto leading-relaxed">Answers are grounded in the real workspace — files, problems, terminal and git state.</p>
+            <div className="flex flex-wrap gap-1 justify-center pt-2">
+              {["explain the architecture", "find bugs in this project", "@codebase where is auth handled?", "how do I run this?"].map((q) => (
+                <button key={q} className="chip cursor-pointer hover:border-[var(--ember)] hover:text-[var(--ember)] transition-colors" onClick={() => { setInput(q); }}>{q}</button>
               ))}
             </div>
           </div>
-        )}
-        {msgs.map((m) => (
-          <div key={m.id} className={`anim-fade-up ${m.role === "user" ? "flex justify-end" : ""}`}>
-            {m.role === "user" ? (
-              <div className="max-w-[88%] rounded-xl rounded-br-sm px-3 py-2 text-[12.5px] leading-relaxed whitespace-pre-wrap"
-                style={{ background: "var(--ember-soft)", border: "1px solid var(--ember)" }}>
-                {m.content}
-              </div>
-            ) : (
-              <div className="max-w-[96%]">
-                {m.model && <div className="text-[9.5px] font-mono text-[var(--tx3)] mb-1">{m.model}</div>}
+        ) : (
+          chat.messages.map((m) => (
+            <div key={m.id} className={`anim-fade-up ${m.role === "user" ? "flex justify-end" : ""}`}>
+              <div className={`max-w-[92%] rounded-xl px-3 py-2 text-[12.5px] leading-relaxed ${m.role === "user" ? "rounded-br-sm" : "raised rounded-bl-sm"}`}
+                style={m.role === "user" ? { background: "var(--ember-soft)", border: "1px solid var(--ember)", color: "var(--tx)" } : undefined}>
+                {m.attachments && m.attachments.length > 0 && (
+                  <div className="flex gap-1 mb-1">{m.attachments.map((a) => <span key={a} className="chip !py-0 !text-[9px]"><ImagePlus size={8} /> {a}</span>)}</div>
+                )}
                 <Markdown text={m.content} />
+                {m.model && m.role === "assistant" && <div className="text-[9px] text-[var(--tx3)] mt-1 font-mono">{m.model}</div>}
               </div>
-            )}
-          </div>
-        ))}
-        {streaming && (
-          <div className="anim-fade">
-            <div className="flex items-center gap-2 text-[10px] font-mono text-[var(--ember)] mb-1">
-              <Spinner size={10} /> generating…
             </div>
-            <Markdown text={streamText} />
-            <span className="caret-blink inline-block w-[7px] h-[13px] align-middle" style={{ background: "var(--ember)" }} />
+          ))
+        )}
+        {streaming && (
+          <div className="raised rounded-xl rounded-bl-sm px-3 py-2 text-[12.5px] leading-relaxed anim-fade">
+            <Markdown text={streamText || "…"} />
+            <span className="caret-blink inline-block w-[7px] h-[13px] align-middle ml-0.5" style={{ background: "var(--ember)" }} />
           </div>
         )}
       </div>
 
-      <div className="flex-none p-2.5 border-t border-[var(--line)] space-y-1.5">
+      <div className="flex-none border-t border-[var(--line)] p-2.5 space-y-1.5">
+        {attachments.length > 0 && (
+          <div className="flex flex-wrap gap-1">
+            {attachments.map((a) => (
+              <span key={a.name} className="chip !text-[9.5px]">
+                <ImagePlus size={9} /> {a.name}
+                <button onClick={() => useStore.getState().removeAttachment(a.name)}><X size={8} /></button>
+              </span>
+            ))}
+            <span className="text-[9px] text-[var(--tx3)] self-center">sent to vision-capable models only</span>
+          </div>
+        )}
         <div className="flex flex-wrap gap-1">
           {MENTIONS.map((m) => (
-            <button key={m} className="chip cursor-pointer !text-[10px] hover:!text-[var(--ember)] hover:!border-[var(--ember)] transition-colors"
-              onClick={() => { setInput((v) => (v ? v + " " : "") + m + " "); taRef.current?.focus(); }}>
-              <AtSign size={9} /> {m.slice(1)}
+            <button key={m} className="chip !py-0 !text-[9.5px] cursor-pointer hover:text-[var(--ember)] hover:border-[var(--ember)] transition-colors"
+              onClick={() => setInput((v) => v + (v.endsWith(" ") || !v ? "" : " ") + "@" + m + (m === "file" ? " " : ""))}>
+              @{m}
             </button>
           ))}
         </div>
         <div className="flex items-end gap-1.5">
+          <input ref={fileRef} type="file" accept="image/*" className="hidden" onChange={(e) => { const f = e.target.files?.[0]; if (f) attach(f); e.target.value = ""; }} />
+          <button className="btn !px-2 flex-none" title="Attach screenshot" onClick={() => fileRef.current?.click()}><Paperclip size={12} /></button>
           <textarea
-            ref={taRef}
-            className="input !py-2 resize-none"
+            className="input resize-none !text-[12px]"
             rows={2}
-            placeholder={workspace ? "Ask… (Ctrl+Enter to send)" : "Open a project, then ask…"}
+            placeholder="Message… (Ctrl+Enter to send)"
             value={input}
             onChange={(e) => setInput(e.target.value)}
-            onKeyDown={(e) => {
-              if ((e.ctrlKey || e.metaKey) && e.key === "Enter") { e.preventDefault(); submit(); }
-            }}
+            onKeyDown={(e) => { if (e.key === "Enter" && (e.ctrlKey || e.metaKey)) { e.preventDefault(); send(); } }}
           />
           {streaming ? (
-            <button className="btn btn-danger !px-2.5 h-[34px]" onClick={stopGeneration} title="Stop (Esc)"><Square size={12} fill="currentColor" /></button>
+            <button className="btn btn-danger !px-2 flex-none" onClick={regenerateLastStop} title="Stop (Esc)"><Square size={11} fill="currentColor" /></button>
           ) : (
-            <button className="btn btn-primary !px-2.5 h-[34px]" onClick={submit} disabled={!input.trim()} title="Send (Ctrl+Enter)"><Send size={13} /></button>
-          )}
-          {msgs.length > 0 && !streaming && (
-            <button className="btn !px-2 h-[34px]" onClick={regenerateLast} title="Regenerate last answer"><RotateCcw size={12} /></button>
+            <button className="btn btn-primary !px-2 flex-none" onClick={send} disabled={!input.trim()} title="Send"><Send size={12} /></button>
           )}
         </div>
+        {chat && chat.messages.some((m) => m.role === "assistant") && !streaming && (
+          <button className="text-[10px] text-[var(--tx3)] hover:text-[var(--ember)] flex items-center gap-1" onClick={regenerateLast}><RefreshCw size={9} /> Regenerate last answer</button>
+        )}
       </div>
-    </>
+    </div>
   );
+}
+
+function regenerateLastStop() {
+  // Esc-like stop: abort current stream via engine stop
+  void import("../agents/engine").then((m) => m.stopGeneration());
 }
 
 /* ─────────────── Agent ─────────────── */
 
 function AgentView() {
   const tasks = useStore((s) => s.tasks);
-  const agentRunning = useStore((s) => s.agentRunning);
   const agents = useStore((s) => s.agents);
-  const pending = useStore((s) => s.pending);
-  const workspace = useStore((s) => s.workspace);
-  const [prompt, setPrompt] = useState("");
+  const autonomy = useStore((s) => s.autonomy);
+  const agentRunning = useStore((s) => s.agentRunning);
+  const [input, setInput] = useState("");
 
-  const active = tasks.find((t) => t.status === "running" || t.status === "blocked") ?? tasks[0];
+  const active = tasks.find((t) => t.status === "running");
+  const queued = tasks.filter((t) => t.status === "queued");
 
-  const run = () => {
-    if (!prompt.trim() || agentRunning) return;
-    const p = prompt;
-    setPrompt("");
-    void runAgentTask(p);
+  const send = () => {
+    const t = input.trim();
+    if (!t) return;
+    setInput("");
+    submitAgentTask(t);
   };
 
   return (
-    <>
-      <div className="flex-none p-2.5 border-b border-[var(--line)] space-y-1.5">
-        <textarea
-          className="input resize-none"
-          rows={3}
-          placeholder={workspace ? 'e.g. "Create login and registration"' : "Open a project, then delegate a task…"}
-          value={prompt}
-          onChange={(e) => setPrompt(e.target.value)}
-          onKeyDown={(e) => { if ((e.ctrlKey || e.metaKey) && e.key === "Enter") { e.preventDefault(); run(); } }}
-        />
-        <div className="flex items-center gap-2">
-          <button className="btn btn-primary flex-1 justify-center" onClick={run} disabled={!prompt.trim() || agentRunning}>
-            {agentRunning ? <><Spinner size={12} /> Crew working…</> : <><Zap size={13} /> Run agent crew</>}
-          </button>
-          {agentRunning && <button className="btn btn-danger" onClick={stopGeneration}><Square size={11} fill="currentColor" /></button>}
-        </div>
-        <p className="text-[10px] text-[var(--tx3)] leading-relaxed">
-          Orchestrator → Architect → Repository → Coder → Tester → Debugger → Reviewer. Edits land as pending diffs.
-        </p>
-      </div>
-
+    <div className="flex flex-col h-full">
       <div className="flex-1 overflow-y-auto scroll-thin p-2.5 space-y-2.5">
-        {agentRunning && (
-          <div className="raised rounded-lg p-2.5 space-y-1.5 anim-fade">
-            <SectionLabel>Live pipeline</SectionLabel>
-            {(["orchestrator", "architect", "repository", "coder", "tester", "debugger", "reviewer"] as const).map((r) => {
-              const a = agents[r];
-              const meta = ROLE_META[r];
-              const Icon = meta.icon;
-              if (a.status === "idle" && !agentRunning) return null;
-              return (
-                <div key={r} className="flex items-center gap-2 text-[11.5px]">
-                  <Icon size={12} style={{ color: meta.color }} />
-                  <span className="w-[76px] flex-none">{meta.label}</span>
-                  <span className="flex-1 truncate text-[var(--tx2)]">{a.note || a.status}</span>
-                  <StatusGlyph status={a.status} />
-                </div>
-              );
-            })}
+        <div className="raised rounded-lg p-2.5 anim-fade">
+          <div className="flex items-center gap-1.5 mb-1.5">
+            <Zap size={11} style={{ color: "var(--ember)" }} />
+            <span className="text-[11px] font-semibold font-display tracking-wide uppercase">delegate a task</span>
+            <span className="chip !py-0 !text-[9px] ml-auto uppercase" style={{ color: autonomy === "auto" ? "var(--ok)" : autonomy === "plan" ? "var(--info)" : "var(--warn)" }}>{autonomy}</span>
           </div>
-        )}
-
-        {active && (
-          <div className="raised rounded-lg p-2.5 space-y-2 anim-fade-up">
-            <div className="flex items-center gap-2">
-              <span className="font-display text-[12px] font-semibold truncate flex-1">{active.title}</span>
-              <span className="chip !py-0 !text-[9.5px] uppercase" style={{
-                color: active.status === "done" ? "var(--ok)" : active.status === "running" ? "var(--ember)" : active.status === "blocked" || active.status === "failed" ? "var(--danger)" : "var(--tx3)",
-                borderColor: "currentColor",
-              }}>{active.status}</span>
-            </div>
-            {active.todos.length > 0 && (
-              <div className="space-y-[3px]">
-                {active.todos.map((t, i) => (
-                  <div key={i} className="flex items-center gap-1.5 text-[11px]">
-                    <StatusGlyph status={t.status} />
-                    <span className={t.status === "done" ? "line-through text-[var(--tx3)]" : "text-[var(--tx2)]"}>{t.text}</span>
+          {active ? (
+            <div>
+              <div className="flex items-center gap-1.5 text-[11.5px]"><Spinner size={11} /><span className="truncate font-medium">{active.title}</span></div>
+              <div className="mt-1.5 space-y-[3px]">
+                {active.steps.map((s) => (
+                  <div key={s.id} className="flex items-center gap-1.5 text-[10.5px]">
+                    {s.status === "done" ? <Check size={9} style={{ color: "var(--ok)" }} /> : s.status === "running" ? <Spinner size={9} /> : s.status === "failed" ? <X size={9} style={{ color: "var(--danger)" }} /> : <span className="w-[9px] h-[9px] rounded-full border border-[var(--line2)] flex-none" />}
+                    <span style={{ color: s.status === "pending" ? "var(--tx3)" : undefined }}>{s.label}</span>
                   </div>
                 ))}
               </div>
-            )}
-            {active.summary && <p className="text-[11px] text-[var(--tx2)] leading-relaxed border-t border-[var(--line)] pt-2">{active.summary}</p>}
-            {pending.filter((c) => c.taskId === active.id).length > 0 && (
-              <p className="text-[10.5px]" style={{ color: "var(--warn)" }}>
-                {pending.filter((c) => c.taskId === active.id).length} change(s) waiting in Source Control →
-              </p>
-            )}
-          </div>
-        )}
+              {active.todos.length > 0 && (
+                <div className="mt-1.5 border-t border-[var(--line)] pt-1.5">
+                  {active.todos.map((t, i) => (
+                    <div key={i} className="font-mono text-[9.5px]" style={{ color: t.status === "done" ? "var(--ok)" : t.status === "running" ? "var(--ember)" : "var(--tx3)" }}>[{t.status}] {t.text}</div>
+                  ))}
+                </div>
+              )}
+              <div className="flex flex-wrap gap-1 mt-2">
+                {Object.values(agents).filter((a) => a.status !== "idle").map((a) => {
+                  const meta = AGENT_META[a.role];
+                  return (
+                    <span key={a.role} className="chip !py-0 !text-[9px]" title={a.note}>
+                      <AgentStatusIcon status={a.status} size={8} /> {meta.label}
+                    </span>
+                  );
+                })}
+              </div>
+            </div>
+          ) : (
+            <p className="text-[10.5px] text-[var(--tx3)]">The orchestrator decomposes work and picks the crew — architect, frontend/backend, database, tester, debugger, reviewer. Dangerous commands always ask first.</p>
+          )}
+        </div>
 
-        {!active && !agentRunning && (
-          <p className="text-[11.5px] text-[var(--tx3)] leading-relaxed px-1">
-            No tasks yet. The crew decomposes your request, inspects the repository, writes code,
-            validates it with the testing engine and reviews every change — all recorded in the Tasks panel.
-          </p>
-        )}
-
-        {tasks.length > 1 && (
+        {queued.length > 0 && (
           <div>
-            <SectionLabel>History</SectionLabel>
-            {tasks.slice(1, 8).map((t) => (
-              <div key={t.id} className="flex items-center gap-2 py-[3px] text-[11px]">
-                <span className={`led ${t.status === "done" ? "led-ok" : t.status === "failed" || t.status === "blocked" ? "led-danger" : "led-off"}`} style={{ width: 6, height: 6 }} />
-                <span className="truncate flex-1 text-[var(--tx2)]">{t.title}</span>
-                <span className="text-[9.5px] text-[var(--tx3)]">{timeAgo(t.createdAt)}</span>
+            <SectionLabel>queued ({queued.length})</SectionLabel>
+            {queued.map((t, i) => (
+              <div key={t.id} className="raised rounded-md px-2 py-1.5 mb-1 flex items-center gap-2 text-[11px]">
+                <span className="chip !py-0 !text-[9px]">#{i + 1}</span>
+                <span className="truncate flex-1">{t.title}</span>
               </div>
             ))}
           </div>
         )}
+
+        {tasks.filter((t) => ["done", "failed", "blocked", "cancelled"].includes(t.status)).slice(-6).reverse().map((t) => (
+          <div key={t.id} className="raised rounded-md px-2 py-1.5 text-[10.5px]">
+            <div className="flex items-center gap-1.5">
+              {t.status === "done" ? <Check size={10} style={{ color: "var(--ok)" }} /> : <X size={10} style={{ color: t.status === "cancelled" ? "var(--tx3)" : "var(--danger)" }} />}
+              <span className="truncate flex-1 font-medium">{t.title}</span>
+              <span className="text-[9px] text-[var(--tx3)]">{timeAgo(t.createdAt)}</span>
+            </div>
+            {t.summary && <p className="text-[var(--tx3)] mt-0.5 truncate">{t.summary}</p>}
+          </div>
+        ))}
       </div>
-    </>
+
+      <div className="flex-none border-t border-[var(--line)] p-2.5">
+        <div className="flex items-end gap-1.5">
+          <textarea className="input resize-none !text-[12px]" rows={3} placeholder='e.g. "Create login and registration" — the crew does the rest'
+            value={input} onChange={(e) => setInput(e.target.value)}
+            onKeyDown={(e) => { if (e.key === "Enter" && (e.ctrlKey || e.metaKey)) { e.preventDefault(); send(); } }} />
+          <button className="btn btn-primary !px-2 flex-none" onClick={send} disabled={!input.trim() || agentRunning && false} title="Queue task">
+            {agentRunning ? <Spinner size={12} /> : <Play size={12} />}
+          </button>
+        </div>
+        <p className="text-[9px] text-[var(--tx3)] mt-1">Tasks queue behind running ones; parallel agents are file-locked. Ctrl+Enter to send.</p>
+      </div>
+    </div>
   );
 }
 
@@ -325,147 +290,78 @@ function AgentView() {
 
 function PlanView() {
   const plan = useStore((s) => s.plan);
-  const workspace = useStore((s) => s.workspace);
-  const [prompt, setPrompt] = useState("");
+  const [input, setInput] = useState("");
   const [busy, setBusy] = useState(false);
 
   const gen = async () => {
-    if (!prompt.trim() || busy) return;
+    const t = input.trim();
+    if (!t || busy) return;
     setBusy(true);
-    try {
-      await generatePlan(prompt);
-    } finally {
-      setBusy(false);
-    }
+    try { await generatePlan(t); } finally { setBusy(false); }
   };
 
   return (
-    <>
-      <div className="flex-none p-2.5 border-b border-[var(--line)] space-y-1.5">
-        <textarea
-          className="input resize-none"
-          rows={3}
-          placeholder={workspace ? 'e.g. "Create admin authentication" — plan first, code never' : "Open a project to plan against it…"}
-          value={prompt}
-          onChange={(e) => setPrompt(e.target.value)}
-          onKeyDown={(e) => { if ((e.ctrlKey || e.metaKey) && e.key === "Enter") { e.preventDefault(); void gen(); } }}
-        />
-        <button className="btn w-full justify-center" onClick={() => void gen()} disabled={!prompt.trim() || busy}>
-          {busy ? <><Spinner size={12} /> Analyzing repository…</> : <><Compass size={13} /> Generate implementation plan</>}
-        </button>
-        <p className="text-[10px] text-[var(--tx3)]">Plan Mode is read-only: it inspects the project and proposes — nothing is written until you send it to the agents.</p>
-      </div>
+    <div className="flex flex-col h-full">
       <div className="flex-1 overflow-y-auto scroll-thin p-2.5">
         {plan ? <PlanCard /> : (
-          <p className="text-[11.5px] text-[var(--tx3)] leading-relaxed px-1">
-            No plan yet. A plan lists the architecture analysis, files to modify and create,
-            dependencies, ordered steps, testing strategy and risks — with approve / reject / send-to-agent controls.
-          </p>
+          <div className="text-center pt-10 space-y-2">
+            <p className="font-display text-[13px] font-semibold">Think before coding</p>
+            <p className="text-[11px] text-[var(--tx3)] max-w-[250px] mx-auto">Plan mode inspects the project and drafts an implementation plan. It never touches files until you approve.</p>
+          </div>
         )}
       </div>
-    </>
+      <div className="flex-none border-t border-[var(--line)] p-2.5">
+        <div className="flex items-end gap-1.5">
+          <textarea className="input resize-none !text-[12px]" rows={2} placeholder='e.g. "Add JWT authentication"' value={input}
+            onChange={(e) => setInput(e.target.value)}
+            onKeyDown={(e) => { if (e.key === "Enter" && (e.ctrlKey || e.metaKey)) { e.preventDefault(); void gen(); } }} />
+          <button className="btn btn-primary !px-2 flex-none" onClick={() => void gen()} disabled={!input.trim() || busy}>
+            {busy ? <Spinner size={12} /> : <Wand2 size={12} />}
+          </button>
+        </div>
+      </div>
+    </div>
   );
 }
 
 export function PlanCard() {
   const plan = useStore((s) => s.plan);
-  const agentRunning = useStore((s) => s.agentRunning);
-  const [editing, setEditing] = useState(false);
-  const [editText, setEditText] = useState("");
+  const setPlan = useStore((s) => s.setPlan);
+  const openFile = useStore((s) => s.openFile);
   if (!plan) return null;
-
-  const statusColor = plan.status === "approved" ? "var(--ok)" : plan.status === "rejected" ? "var(--danger)" : "var(--warn)";
-
-  if (editing) {
-    return (
-      <div className="space-y-2 anim-fade">
-        <SectionLabel>Edit plan task</SectionLabel>
-        <textarea className="input resize-none" rows={4} value={editText} onChange={(e) => setEditText(e.target.value)} autoFocus />
-        <div className="flex gap-2">
-          <button className="btn btn-primary flex-1 justify-center" onClick={() => { setEditing(false); void generatePlan(editText); }}>Re-plan</button>
-          <button className="btn" onClick={() => setEditing(false)}>Cancel</button>
-        </div>
-      </div>
-    );
-  }
-
   return (
-    <div className="space-y-3 anim-fade-up">
-      <div className="flex items-start gap-2">
-        <div className="flex-1">
-          <div className="font-display font-semibold text-[14px] leading-snug">{plan.task}</div>
-          <div className="text-[9.5px] text-[var(--tx3)] mt-0.5">{timeAgo(plan.createdAt)}</div>
-        </div>
-        <span className="chip uppercase !text-[9.5px]" style={{ color: statusColor, borderColor: statusColor }}>{plan.status}</span>
+    <div className="raised rounded-xl p-4 anim-fade-up space-y-3">
+      <div className="flex items-center gap-2">
+        <span className="font-display font-bold text-[14px]">Implementation plan</span>
+        <span className="chip !py-0 uppercase" style={{ color: plan.status === "approved" ? "var(--ok)" : plan.status === "rejected" ? "var(--danger)" : "var(--warn)" }}>{plan.status}</span>
       </div>
-
-      <div>
-        <SectionLabel>Architecture analysis</SectionLabel>
-        <p className="text-[11.5px] text-[var(--tx2)] leading-relaxed">{plan.analysis}</p>
-      </div>
-
-      <div className="grid grid-cols-2 gap-2">
-        <div className="raised rounded-lg p-2">
-          <SectionLabel>Modify ({plan.filesToModify.length})</SectionLabel>
-          {plan.filesToModify.length === 0 && <span className="text-[10.5px] text-[var(--tx3)]">none</span>}
-          {plan.filesToModify.map((f) => <div key={f} className="font-mono text-[10.5px] truncate" style={{ color: "var(--warn)" }}>{f}</div>)}
-        </div>
-        <div className="raised rounded-lg p-2">
-          <SectionLabel>Create ({plan.filesToCreate.length})</SectionLabel>
-          {plan.filesToCreate.length === 0 && <span className="text-[10.5px] text-[var(--tx3)]">none</span>}
-          {plan.filesToCreate.map((f) => <div key={f} className="font-mono text-[10.5px] truncate" style={{ color: "var(--ok)" }}>{f}</div>)}
-        </div>
-      </div>
-
-      {plan.dependencies.length > 0 && (
+      <p className="text-[12px] text-[var(--tx2)]">{plan.task}</p>
+      <div><SectionLabel>architecture analysis</SectionLabel><p className="text-[11.5px] text-[var(--tx2)] leading-relaxed">{plan.analysis}</p></div>
+      <div className="grid grid-cols-2 gap-3">
         <div>
-          <SectionLabel>Dependencies</SectionLabel>
-          <div className="flex flex-wrap gap-1">{plan.dependencies.map((d) => <span key={d} className="chip font-mono !text-[10px]">{d}</span>)}</div>
+          <SectionLabel>modify ({plan.filesToModify.length})</SectionLabel>
+          {plan.filesToModify.map((f) => <button key={f} className="block font-mono text-[10.5px] hover:text-[var(--ember)] truncate max-w-full" onClick={() => openFile(f)}>{f}</button>)}
+          {plan.filesToModify.length === 0 && <span className="text-[10px] text-[var(--tx3)]">none</span>}
         </div>
+        <div>
+          <SectionLabel>create ({plan.filesToCreate.length})</SectionLabel>
+          {plan.filesToCreate.map((f) => <div key={f} className="font-mono text-[10.5px] truncate" style={{ color: "var(--ok)" }}>{f}</div>)}
+          {plan.filesToCreate.length === 0 && <span className="text-[10px] text-[var(--tx3)]">none</span>}
+        </div>
+      </div>
+      {plan.dependencies.length > 0 && (
+        <div><SectionLabel>dependencies</SectionLabel><div className="flex flex-wrap gap-1">{plan.dependencies.map((d) => <span key={d} className="chip !py-0 font-mono !text-[10px]">{d}</span>)}</div></div>
       )}
-
-      <div>
-        <SectionLabel>Implementation steps</SectionLabel>
-        <div className="space-y-1">
-          {plan.steps.map((s, i) => (
-            <div key={i} className="flex gap-2 text-[11.5px] text-[var(--tx2)] leading-relaxed">
-              <span className="font-mono text-[10px] flex-none mt-[2px]" style={{ color: "var(--ember)" }}>{String(i + 1).padStart(2, "0")}</span>
-              <Markdown text={s.replace(/^\d+\.\s*/, "")} />
-            </div>
-          ))}
-        </div>
-      </div>
-
-      <div>
-        <SectionLabel>Testing plan</SectionLabel>
-        <p className="text-[11.5px] text-[var(--tx2)] leading-relaxed">{plan.testing}</p>
-      </div>
-
-      <div>
-        <SectionLabel>Risks</SectionLabel>
-        {plan.risks.map((r, i) => (
-          <div key={i} className="flex gap-1.5 text-[11px] text-[var(--tx2)] py-[2px]">
-            <span style={{ color: "var(--warn)" }}>▲</span> {r}
-          </div>
-        ))}
-      </div>
-
+      <div><SectionLabel>steps</SectionLabel>{plan.steps.map((s, i) => <div key={i} className="text-[11.5px] text-[var(--tx2)] py-[2px]">{s}</div>)}</div>
+      <div><SectionLabel>testing plan</SectionLabel><p className="text-[11.5px] text-[var(--tx2)]">{plan.testing}</p></div>
+      <div><SectionLabel>risks</SectionLabel>{plan.risks.map((r, i) => <div key={i} className="text-[11px] py-[2px]" style={{ color: "var(--warn)" }}>⚠ {r}</div>)}</div>
       {plan.status !== "rejected" && (
-        <div className="flex flex-wrap gap-1.5 pt-1 border-t border-[var(--line)]">
-          {plan.status === "draft" && (
-            <>
-              <button className="btn btn-ok" onClick={approvePlan}><Check size={12} /> Approve</button>
-              <button className="btn btn-danger" onClick={rejectPlan}><X size={12} /> Reject</button>
-              <button className="btn" onClick={() => { setEditText(plan.task); setEditing(true); }}><Wand2 size={12} /> Edit</button>
-            </>
-          )}
-          <button className="btn btn-primary flex-1 justify-center" disabled={agentRunning} onClick={sendPlanToAgent}>
-            <Zap size={12} /> Send to Agent
-          </button>
+        <div className="flex flex-wrap gap-1.5 pt-1">
+          <button className="btn btn-ok !py-1 !text-[11px]" onClick={approvePlan} disabled={plan.status === "approved"}><Check size={11} /> Approve</button>
+          <button className="btn btn-primary !py-1 !text-[11px]" onClick={sendPlanToAgent}><Play size={11} /> Send to agents</button>
+          <button className="btn btn-danger !py-1 !text-[11px]" onClick={rejectPlan}><X size={11} /> Reject</button>
+          <button className="btn btn-ghost !py-1 !text-[11px]" onClick={() => setPlan(null)}>Dismiss</button>
         </div>
-      )}
-      {plan.status === "rejected" && (
-        <p className="text-[11px] text-[var(--tx3)]">Plan rejected. Generate a new one above.</p>
       )}
     </div>
   );
@@ -473,110 +369,72 @@ export function PlanCard() {
 
 /* ─────────────── Test ─────────────── */
 
-const TEST_BUTTONS: { kind: TestKind; label: string; primary?: boolean }[] = [
-  { kind: "all", label: "Test All", primary: true },
-  { kind: "unit", label: "Unit Tests" },
-  { kind: "integration", label: "Integration" },
-  { kind: "build", label: "Build Test" },
-  { kind: "lint", label: "Lint" },
-  { kind: "typecheck", label: "Type Check" },
-  { kind: "runtime", label: "Runtime Test" },
+const SUITES: { id: TestKind; label: string }[] = [
+  { id: "all", label: "Test All" }, { id: "unit", label: "Unit" }, { id: "integration", label: "Integration" },
+  { id: "build", label: "Build" }, { id: "lint", label: "Lint" }, { id: "typecheck", label: "Type Check" }, { id: "runtime", label: "Runtime" },
 ];
 
 function TestView() {
   const testRuns = useStore((s) => s.testRuns);
   const problems = useStore((s) => s.problems);
-  const workspace = useStore((s) => s.workspace);
-  const [running, setRunning] = useState<TestKind | null>(null);
-  const latest = testRuns[0];
+  const [busy, setBusy] = useState<TestKind | null>(null);
 
-  const run = async (kind: TestKind) => {
-    if (running) return;
-    setRunning(kind);
-    try {
-      await runTestSuite(kind);
-    } finally {
-      setRunning(null);
-    }
-  };
-
-  const errors = problems.filter((p) => p.severity === "error");
+  const run = async (k: TestKind) => { setBusy(k); try { await runTestSuite(k); } finally { setBusy(null); } };
+  const last = testRuns[0];
 
   return (
-    <>
-      <div className="flex-none p-2.5 border-b border-[var(--line)]">
+    <div className="flex flex-col h-full">
+      <div className="flex-1 overflow-y-auto scroll-thin p-2.5 space-y-2.5">
         <div className="grid grid-cols-2 gap-1.5">
-          {TEST_BUTTONS.map((b) => (
-            <button
-              key={b.kind}
-              className={`btn justify-center !py-1.5 !text-[11.5px] ${b.primary ? "btn-primary" : ""}`}
-              disabled={!!running || !workspace}
-              onClick={() => void run(b.kind)}
-            >
-              {running === b.kind ? <Spinner size={11} /> : <FlaskConical size={11} />} {b.label}
+          {SUITES.map((s) => (
+            <button key={s.id} className="raised rounded-lg py-2 text-[11.5px] font-medium flex items-center justify-center gap-1.5 hover:border-[var(--ember)] transition-all"
+              onClick={() => void run(s.id)} disabled={busy !== null}>
+              {busy === s.id ? <Spinner size={11} /> : <FlaskConical size={11} className="text-[var(--tx3)]" />}
+              {s.label}
             </button>
           ))}
-          <button className="btn btn-danger justify-center !py-1.5 !text-[11.5px]" disabled={errors.length === 0}
-            onClick={() => fixWithAI(errors)} title="Send current errors to the Debug agent">
-            <Wand2 size={11} /> Fix with AI
-          </button>
         </div>
-        <p className="text-[10px] text-[var(--tx3)] mt-1.5 leading-relaxed">
-          Static engine: lint scan, import-graph + syntax type check, test-file verification, build graph. Real results, computed live.
-        </p>
-      </div>
-
-      <div className="flex-1 overflow-y-auto scroll-thin p-2.5 space-y-2.5">
-        {latest && (
-          <div className="raised rounded-lg p-3 anim-fade-up">
-            <div className="flex items-center gap-2 mb-2">
-              <span className="font-display text-[12px] font-semibold uppercase tracking-wide">Latest: {latest.kind}</span>
-              <span className="ml-auto text-[9.5px] text-[var(--tx3)]">{timeAgo(latest.at)}</span>
+        {last && (
+          <div className="raised rounded-lg p-2.5 anim-fade-up">
+            <div className="flex items-center gap-2 text-[11px]">
+              <span className="font-mono uppercase text-[9.5px] text-[var(--tx3)]">{last.kind}</span>
+              <span style={{ color: "var(--ok)" }}>{last.passed} passed</span>
+              <span style={{ color: last.failed ? "var(--danger)" : "var(--tx3)" }}>{last.failed} failed</span>
+              <span className="text-[var(--tx3)]">{last.skipped} skipped · {last.durationMs}ms</span>
             </div>
-            <div className="grid grid-cols-4 gap-1.5 text-center mb-2">
-              {[
-                ["Passed", latest.passed, "var(--ok)"],
-                ["Failed", latest.failed, latest.failed ? "var(--danger)" : "var(--tx3)"],
-                ["Skipped", latest.skipped, "var(--tx3)"],
-                ["Time", `${latest.durationMs}ms`, "var(--tx2)"],
-              ].map(([label, val, color]) => (
-                <div key={label as string} className="rounded-lg py-1.5" style={{ background: "var(--bg3)" }}>
-                  <div className="font-display font-bold text-[16px]" style={{ color: color as string }}>{val}</div>
-                  <div className="text-[9px] uppercase tracking-wide text-[var(--tx3)]">{label}</div>
-                </div>
-              ))}
-            </div>
-            <div className="font-mono text-[10px] leading-[1.6] max-h-[140px] overflow-y-auto scroll-thin rounded-md p-2" style={{ background: "var(--bg0)" }}>
-              {latest.lines.map((l, i) => (
+            <div className="mt-1.5 max-h-[130px] overflow-y-auto scroll-thin font-mono text-[10px] leading-[1.6]">
+              {last.lines.map((l, i) => (
                 <div key={i} style={{ color: l.kind === "err" ? "var(--danger)" : l.kind === "sys" ? "var(--info)" : "var(--tx2)", whiteSpace: "pre-wrap" }}>{l.text}</div>
               ))}
             </div>
           </div>
         )}
-
+        <div className="flex flex-wrap gap-1.5">
+          <button className="btn !py-1 !text-[11px]" disabled={!problems.some((p) => p.severity === "error")} onClick={() => fixWithAI(problems.filter((p) => p.severity === "error"))}>
+            <Wand2 size={11} /> Fix failures with AI
+          </button>
+          <button className="btn !py-1 !text-[11px]" disabled={!last || last.failed === 0}
+            onClick={() => { if (last) void sendChat(`Explain this test failure and suggest a fix:\n${last.lines.filter((l) => l.kind === "err").slice(-6).map((l) => l.text).join("\n")}`); }}>
+            <Zap size={11} /> Explain failure
+          </button>
+        </div>
         {testRuns.length > 1 && (
           <div>
-            <SectionLabel>Recent runs</SectionLabel>
+            <SectionLabel>history</SectionLabel>
             {testRuns.slice(1, 10).map((r) => (
-              <div key={r.id} className="flex items-center gap-2 py-[3px] text-[11px]">
-                <span className={`led ${r.failed ? "led-danger" : "led-ok"}`} style={{ width: 6, height: 6 }} />
-                <span className="font-mono uppercase text-[9.5px] text-[var(--tx3)] w-[74px]">{r.kind}</span>
+              <div key={r.id} className="flex items-center gap-2 text-[10.5px] py-[3px]">
+                <span className="font-mono uppercase text-[9px] text-[var(--tx3)] w-[72px]">{r.kind}</span>
                 <span style={{ color: "var(--ok)" }}>{r.passed}✓</span>
                 <span style={{ color: r.failed ? "var(--danger)" : "var(--tx3)" }}>{r.failed}✗</span>
-                <span className="ml-auto text-[9.5px] text-[var(--tx3)]">{r.durationMs}ms · {timeAgo(r.at)}</span>
+                <span className="ml-auto text-[9px] text-[var(--tx3)]">{timeAgo(r.at)}</span>
               </div>
             ))}
           </div>
         )}
-
-        {!latest && (
-          <p className="text-[11.5px] text-[var(--tx3)] leading-relaxed px-1">
-            {workspace
-              ? `Ready — ${Object.keys(workspace.files).length} files indexed. Run Test All for the full computed report.`
-              : "Open a project to run validation suites."}
-          </p>
-        )}
       </div>
-    </>
+      <div className="flex-none border-t border-[var(--line)] px-3 py-2 text-[9.5px] text-[var(--tx3)] leading-relaxed">
+        Suites run as real static validation in this runtime (import graph, syntax, JSON, test-file verification). OS-bound runners (vitest CLI, pytest) execute in the desktop build.
+      </div>
+    </div>
   );
 }

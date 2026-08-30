@@ -222,6 +222,8 @@ export interface AppState {
   setPreview: (patch: Partial<PreviewState>) => void;
   resetPreview: () => void;
   setInlineEdit: (v: InlineEditState | null) => void;
+  setSelection: (v: string) => void;
+  pushPreviewConsole: (l: TermLine) => void;
   setIndex: (i: ProjectIndex | null) => void;
   refreshResources: () => void;
 }
@@ -841,6 +843,8 @@ export const useStore = create<AppState>()((set, get) => ({
   setPreview: (patch) => set((s) => ({ preview: { ...s.preview, ...patch } })),
   resetPreview: () => set({ preview: DEFAULT_PREVIEW }),
   setInlineEdit: (v) => set({ inlineEdit: v }),
+  setSelection: (v) => set({ selection: v }),
+  pushPreviewConsole: (l) => set((s) => ({ preview: { ...s.preview, consoleLines: [...s.preview.consoleLines.slice(-199), l] } })),
   setIndex: (i) => set({ index: i }),
   refreshResources: () => {
     const mem = (performance as unknown as { memory?: { usedJSHeapSize: number; jsHeapSizeLimit: number } }).memory;

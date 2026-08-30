@@ -1,5 +1,5 @@
-import { Activity, ChevronDown, FlaskConical, FolderOpen, GitBranch, Hammer, Play, RefreshCw, Search, Square, Wifi, WifiOff } from "lucide-react";
-import { analyzeProject, buildProject, runProject, stopGeneration, testProject } from "../agents/engine";
+import { Activity, ChevronDown, FlaskConical, FolderOpen, GitBranch, Hammer, Monitor, Play, RefreshCw, Search, Square, Wifi, WifiOff } from "lucide-react";
+import { analyzeProject, buildProject, openPreview, runProject, stopGeneration, testProject } from "../agents/engine";
 import { APP_NAME, APP_VERSION, OFFLINE_MODEL_ID, OFFLINE_MODEL_LABEL } from "../config/app";
 import type { AiMode } from "../lib/types";
 import { useStore } from "../state/store";
@@ -20,6 +20,7 @@ export default function TopBar() {
   const settings = useStore((s) => s.settings);
   const streaming = useStore((s) => s.streaming);
   const agentRunning = useStore((s) => s.agentRunning);
+  const services = useStore((s) => s.services);
   const openLocal = useStore((s) => s.openLocal);
   const openDemo = useStore((s) => s.openDemo);
   const openRecent = useStore((s) => s.openRecent);
@@ -32,6 +33,7 @@ export default function TopBar() {
   const setQuickOpen = useStore((s) => s.setQuickOpen);
 
   const busy = Boolean(streaming) || agentRunning;
+  const runningSvc = services.filter((s) => s.status === "running").length;
 
   return (
     <header className="flex items-center gap-2 px-3 h-[46px] flex-none border-b border-[var(--line)] bg-[var(--bg1)] relative z-30">
@@ -48,7 +50,7 @@ export default function TopBar() {
         trigger={
           <button className="btn btn-ghost !text-[12.5px]">
             <FolderOpen size={13} style={{ color: "var(--ember)" }} />
-            <span className="max-w-[160px] truncate">{workspace ? workspace.label : "Open project"}</span>
+            <span className="max-w-[140px] truncate">{workspace ? workspace.label : "Open project"}</span>
             <ChevronDown size={12} className="text-[var(--tx3)]" />
           </button>
         }
@@ -69,7 +71,7 @@ export default function TopBar() {
         )}
       </Dropdown>
 
-      <span className="chip" title="Local snapshot branch — git commands run in the desktop runtime">
+      <span className="chip" title="Local snapshot branch — real git plumbing runs in the desktop runtime">
         <GitBranch size={11} /> main
       </span>
 
@@ -97,7 +99,7 @@ export default function TopBar() {
       <div className="flex-1" />
 
       <select
-        className="select !w-[190px] !text-[11.5px]"
+        className="select !w-[170px] !text-[11.5px]"
         value={settings.models.chat}
         onChange={(e) => updateSettings({ models: { ...settings.models, chat: e.target.value } })}
         title="Active chat model (auto = first Ollama model when connected)"
@@ -143,17 +145,24 @@ export default function TopBar() {
 
       <span className="w-px h-5 bg-[var(--line2)] mx-0.5" />
 
-      <button className="btn btn-primary !px-3" onClick={runProject} title="Run dev script from package.json">
+      <button className="btn btn-primary !px-3" onClick={runProject} title="Run project using the detected adapter">
         <Play size={13} /> Run
       </button>
-      <button className="btn !px-2.5" onClick={() => void buildProject()} title="Validate build graph"><Hammer size={13} /></button>
-      <button className="btn !px-2.5" onClick={() => void testProject()} title="Run unit suite"><FlaskConical size={13} /></button>
+      <button className="btn !px-2.5" onClick={() => void openPreview()} title="Open live preview">
+        <Monitor size={13} style={{ color: "var(--ember)" }} />
+      </button>
+      <button className="btn !px-2.5" onClick={buildProject} title="Validate build graph"><Hammer size={13} /></button>
+      <button className="btn !px-2.5" onClick={testProject} title="Run unit suite"><FlaskConical size={13} /></button>
       <button className="btn !px-2.5 hidden md:inline-flex" onClick={analyzeProject} title="Project health report"><Activity size={13} /></button>
-      {busy && (
-        <button className="btn btn-danger !px-2.5" onClick={stopGeneration} title="Stop (Esc)">
+      {busy ? (
+        <button className="btn btn-danger !px-2.5" onClick={stopGeneration} title="Stop generation, agents, queue and services (Esc)">
+          <Square size={12} fill="currentColor" /> Stop all
+        </button>
+      ) : runningSvc > 0 ? (
+        <button className="btn btn-danger !px-2.5" onClick={stopGeneration} title="Stop running services">
           <Square size={12} fill="currentColor" /> Stop
         </button>
-      )}
+      ) : null}
     </header>
   );
 }

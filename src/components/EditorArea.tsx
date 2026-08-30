@@ -1,5 +1,6 @@
-import { useMemo, useState } from "react";
-import CodeMirror from "@uiw/react-codemirror";
+import { useEffect, useMemo, useRef, useState } from "react";
+import CodeMirror, { type ReactCodeMirrorRef } from "@uiw/react-codemirror";
+import { keymap } from "@codemirror/view";
 import { javascript } from "@codemirror/lang-javascript";
 import { json } from "@codemirror/lang-json";
 import { markdown } from "@codemirror/lang-markdown";
@@ -8,13 +9,16 @@ import { css } from "@codemirror/lang-css";
 import { python } from "@codemirror/lang-python";
 import { createTheme } from "@uiw/codemirror-themes";
 import { tags as t } from "@lezer/highlight";
-import { Activity, Check, Compass, FileCode2, FolderOpen, Play, WifiOff, X, Zap } from "lucide-react";
-import { APP_NAME, APP_TAGLINE, APP_VERSION, WELCOME_TITLE } from "../config/app";
+import { Activity, Check, Compass, FileCode2, FolderOpen, Monitor, Play, Wand2, WifiOff, X, Zap, XCircle } from "lucide-react";
+import { OFFLINE_MODEL_ID, WELCOME_TITLE, APP_TAGLINE } from "../config/app";
 import { diffLines, diffStats } from "../lib/diff";
 import { detectLanguage } from "../lib/fs";
-import { useResolvedTheme, useStore } from "../state/store";
+import { setGhost as ghostEffect, ghostField, ghostKeymap, ghostTheme } from "../editor/ghost";
+import { acceptInlineEdit, openPreview, runInlineEdit, schedulePreviewRebuild } from "../agents/engine";
+import { resolveModel, useResolvedTheme, useStore } from "../state/store";
+import PreviewPanel from "./PreviewPanel";
 import { PlanCard } from "./AIPanel";
-import { FileGlyph, Kbd, LogoMark, Markdown, SectionLabel } from "./ui";
+import { FileGlyph, Kbd, LogoMark, Markdown, SectionLabel, Spinner } from "./ui";
 
 const darkTheme = createTheme({
   theme: "dark",
@@ -85,6 +89,9 @@ export default function EditorArea() {
 
   const active = tabs.find((t) => t.id === activeTabId) ?? null;
 
+  /* schedule preview rebuilds when files change (auto-refresh acts like HMR) */
+  useEffect(() => { schedulePreviewRebuild(); }, [dirty, workspace]);
+
   return (
     <div className="flex flex-col h-full min-w-0 bg-[var(--bg0)]">
       <div className="flex items-end h-[34px] flex-none overflow-x-auto scroll-thin bg-[var(--bg1)] border-b border-[var(--line)]">
@@ -101,6 +108,7 @@ export default function EditorArea() {
               {tab.kind === "diff" && <FileCode2 size={12} style={{ color: "var(--warn)" }} />}
               {tab.kind === "plan" && <Compass size={12} style={{ color: "var(--info)" }} />}
               {tab.kind === "report" && <Activity size={12} style={{ color: "var(--ok)" }} />}
+              {tab.kind === "preview" && <Monitor size={12} style={{ color: "var(--ember)" }} />}
               <span className="truncate">{tab.title}</span>
               {isDirty && <span className="w-[6px] h-[6px] rounded-full flex-none" style={{ background: "var(--ember)" }} />}
               <button
@@ -118,6 +126,7 @@ export default function EditorArea() {
           active.kind === "file" && active.path ? <FileEditor path={active.path} />
             : active.kind === "diff" && active.changeId ? <DiffView changeId={active.changeId} />
             : active.kind === "plan" ? <div className="h-full overflow-y-auto scroll-thin p-5"><PlanCard /></div>
+            : active.kind === "preview" ? <PreviewPanel />
             : active.kind === "report" ? <ReportView />
             : null
         )}
@@ -150,13 +159,10 @@ function WelcomeScreen() {
   const recents = useStore((s) => s.recents);
   const ollama = useStore((s) => s.ollama);
   const connectOllama = useStore((s) => s.connectOllama);
-  const [skip, setSkip] = useState(false);
-
-  if (skip) return <NoProjectConsole />;
 
   return (
     <div className="h-full overflow-y-auto scroll-thin dotgrid">
-      <div className="max-w-[860px] mx-auto px-8 py-12 grid md:grid-cols-[1.1fr_1fr] gap-10 anim-fade-up">
+      <div className="max-w-[880px] mx-auto px-8 py-12 grid md:grid-cols-[1.1fr_1fr] gap-10 anim-fade-up">
         <div>
           <div className="flex items-center gap-3">
             <LogoMark size={46} />
@@ -165,25 +171,24 @@ function WelcomeScreen() {
               <div className="ember-line w-[120px] mt-2" />
             </div>
           </div>
-          <p className="font-display text-[13px] tracking-[0.2em] uppercase text-[var(--tx3)] mt-4">{APP_TAGLINE}</p>
-          <p className="text-[13.5px] text-[var(--tx2)] leading-relaxed mt-4 max-w-[420px]">
-            {WELCOME_TITLE}. Open any project, talk to your code, and let a crew of
-            specialist agents — architect, coder, tester, debugger, reviewer — implement,
-            validate and review changes <strong className="text-[var(--tx)]">with your approval</strong>.
-            Everything stays on this machine; Ollama provides the models.
+          <p className="font-display text-[12.5px] tracking-[0.2em] uppercase text-[var(--tx3)] mt-4">{APP_TAGLINE}</p>
+          <p className="text-[13.5px] text-[var(--tx2)] leading-relaxed mt-4 max-w-[430px]">
+            Open any project — React, FastAPI, Spring, Rust, plain HTML — and run it with a live
+            in-IDE preview. Delegate work to a file-locked multi-agent crew, review every change
+            as a diff, and keep all data on this machine.
           </p>
           <div className="flex flex-wrap gap-2 mt-5">
-            <span className="chip">7 specialist agents</span>
-            <span className="chip">diff-reviewed edits</span>
-            <span className="chip">checkpoints & undo</span>
-            <span className="chip">Ollama streaming</span>
-            <span className="chip">permission-gated commands</span>
+            <span className="chip">16 project adapters</span>
+            <span className="chip">live preview</span>
+            <span className="chip">12 agent roles</span>
+            <span className="chip">inline AI · Ctrl+K</span>
+            <span className="chip">checkpoints</span>
           </div>
-          <div className="flex items-center gap-3 mt-8 text-[11.5px] text-[var(--tx3)] flex-wrap">
-            <span><Kbd>Ctrl P</Kbd> quick open</span>
+          <div className="flex items-center gap-3 mt-8 text-[11.5px] text-[var(--tx3)]">
+            <span><Kbd>Ctrl P</Kbd> files</span>
             <span><Kbd>Ctrl Shift P</Kbd> palette</span>
             <span><Kbd>Ctrl J</Kbd> terminal</span>
-            <span><Kbd>Esc</Kbd> stop</span>
+            <span><Kbd>Ctrl K</Kbd> inline AI</span>
           </div>
         </div>
 
@@ -194,6 +199,9 @@ function WelcomeScreen() {
           </button>
           <button className="btn w-full justify-center !py-2 mb-2" onClick={() => void openDemo()}>
             <Play size={14} /> Explore the demo workspace
+          </button>
+          <button className="btn w-full justify-center !py-2 mb-2" onClick={() => void openPreview()}>
+            <Monitor size={14} /> Open Live Preview
           </button>
           <button className="btn w-full justify-center !py-2" onClick={() => void connectOllama()}>
             {ollama.status === "connected"
@@ -207,8 +215,8 @@ function WelcomeScreen() {
               1. Install Ollama from ollama.com<br />
               2. Start it — <code>ollama serve</code><br />
               3. Pull a coding model — <code>ollama pull qwen2.5-coder:7b</code><br />
-              4. Click <strong>Connect Ollama</strong> above.<br />
-              <span className="text-[var(--tx3)]">Meanwhile the built-in heuristic engine keeps every feature working.</span>
+              4. Click <strong>Connect Ollama</strong>.<br />
+              <span className="text-[var(--tx3)]">The built-in heuristic engine keeps every workflow running meanwhile.</span>
             </div>
           )}
 
@@ -223,65 +231,186 @@ function WelcomeScreen() {
               ))}
             </div>
           )}
-          <button className="mt-4 text-[11px] text-[var(--tx3)] hover:text-[var(--tx2)] underline-offset-2 hover:underline" onClick={() => setSkip(true)}>
-            continue without a project →
-          </button>
         </div>
       </div>
     </div>
   );
 }
 
-function NoProjectConsole() {
-  const openLocal = useStore((s) => s.openLocal);
-  const openDemo = useStore((s) => s.openDemo);
-  const setSidebarView = useStore((s) => s.setSidebarView);
-  return (
-    <div className="h-full dotgrid flex flex-col items-center justify-center gap-4 anim-fade text-center px-6">
-      <LogoMark size={44} />
-      <div>
-        <div className="font-display text-[20px] font-bold">No project open</div>
-        <p className="text-[12.5px] text-[var(--tx3)] mt-1 max-w-[380px]">
-          {APP_NAME} v{APP_VERSION} — open a folder or the demo workspace to index files, chat with context and run agents.
-        </p>
-      </div>
-      <div className="flex gap-2">
-        <button className="btn btn-primary" onClick={() => void openLocal()}><FolderOpen size={13} /> Open Folder</button>
-        <button className="btn" onClick={() => void openDemo()}><Play size={13} /> Demo workspace</button>
-        <button className="btn" onClick={() => setSidebarView("settings")}><Zap size={13} /> Settings</button>
-      </div>
-    </div>
-  );
-}
+/* ─────────────── File editor + ghost completion + inline AI ─────────────── */
 
-/* ─────────────── File editor ─────────────── */
+async function fetchCompletion(prefix: string): Promise<string | null> {
+  const s = useStore.getState();
+  if (s.ollama.status !== "connected") return null;
+  const { model, useOllama } = resolveModel(s, "autocomplete");
+  if (!useOllama || model === OFFLINE_MODEL_ID) return null;
+  try {
+    const res = await fetch(`${s.settings.ollamaUrl.replace(/\/$/, "")}/api/generate`, {
+      method: "POST",
+      body: JSON.stringify({ model, prompt: prefix, stream: false, options: { num_predict: 48, temperature: 0.2 } }),
+    });
+    if (!res.ok) return null;
+    const j = (await res.json()) as { response?: string };
+    return j.response ?? null;
+  } catch { return null; }
+}
 
 function FileEditor({ path }: { path: string }) {
   const workspace = useStore((s) => s.workspace);
   const dirty = useStore((s) => s.dirty);
   const editorChange = useStore((s) => s.editorChange);
   const resolved = useResolvedTheme();
+  const cmRef = useRef<ReactCodeMirrorRef>(null);
+  const ghostRef = useRef<{ clear: () => void } | null>(null);
+  const ghostTimer = useRef<number | null>(null);
+  const inlineEdit = useStore((s) => s.inlineEdit);
+
   const value = dirty[path] ?? workspace?.files[path] ?? "";
   const extensions = useMemo(() => langExtensions(path), [path]);
 
+  const openInline = () => {
+    const view = cmRef.current?.view;
+    if (!view) return;
+    const sel = view.state.selection.main;
+    if (sel.empty) {
+      const line = view.state.doc.lineAt(sel.head);
+      useStore.getState().setInlineEdit({ path, from: line.from, to: line.to, original: line.text, instruction: "", action: "prompt", status: "idle", proposed: null, explanation: null });
+      return;
+    }
+    const original = view.state.doc.sliceString(sel.from, sel.to);
+    useStore.getState().setInlineEdit({ path, from: sel.from, to: sel.to, original, instruction: "", action: "prompt", status: "idle", proposed: null, explanation: null });
+  };
+
+  const inlineKeymap = useMemo(() => keymap.of([{ key: "Mod-k", run: () => { openInline(); return true; } }]), [path]);
+
   if (!workspace) return null;
   return (
-    <div className="h-full overflow-auto scroll-thin">
+    <div className="h-full overflow-auto scroll-thin relative">
       <CodeMirror
+        ref={cmRef}
         value={value}
         theme={resolved === "dark" ? darkTheme : lightTheme}
-        extensions={extensions}
+        extensions={[inlineKeymap, ghostField, ghostKeymap, ghostTheme(), ...extensions]}
         onChange={(v, vu) => {
           editorChange(path, v);
           if (vu) {
             const sel = vu.state.selection.main;
             const text = sel.empty ? "" : v.slice(sel.from, sel.to).slice(0, 4000);
             if (text !== useStore.getState().selection) useStore.setState({ selection: text });
+            /* ghost-text completion (optional, Ollama-backed) */
+            ghostRef.current?.clear(); ghostRef.current = null;
+            const st = useStore.getState();
+            if (!st.settings.autocomplete.enabled || st.ollama.status !== "connected") return;
+            if (ghostTimer.current) window.clearTimeout(ghostTimer.current);
+            const pos = sel.head;
+            const docVersion = v.length + ":" + pos;
+            ghostTimer.current = window.setTimeout(() => {
+              const ctxChars = st.settings.autocomplete.contextChars;
+              const prefix = v.slice(Math.max(0, pos - ctxChars), pos);
+              if (prefix.trim().length < 12) return;
+              void fetchCompletion(prefix).then((completion) => {
+                const view = cmRef.current?.view;
+                if (!view || !completion) return;
+                const nowSel = view.state.selection.main;
+                const nowDoc = view.state.doc.toString();
+                if (nowSel.head !== pos || nowDoc.length + ":" + nowSel.head !== docVersion) return;
+                view.dispatch({ effects: ghostEffect.of({ from: nowSel.head, text: completion.replace(/^\n+/, "") }) });
+                ghostRef.current = { clear: () => view.dispatch({ effects: ghostEffect.of(null) }) };
+              });
+            }, st.settings.autocomplete.delayMs);
+          }
+        }}
+        onUpdate={(vu) => {
+          if (vu.selectionSet) {
+            const sel = vu.state.selection.main;
+            const text = sel.empty ? "" : vu.state.doc.sliceString(sel.from, sel.to).slice(0, 4000);
+            if (text !== useStore.getState().selection) useStore.setState({ selection: text });
+            const line = vu.state.doc.lineAt(sel.head);
+            useStore.getState().setCursorPos(line.number, sel.head - line.from + 1);
           }
         }}
         basicSetup={{ foldGutter: true, highlightActiveLine: true, highlightActiveLineGutter: true, bracketMatching: true, autocompletion: true }}
         style={{ minHeight: "100%" }}
       />
+      {inlineEdit && inlineEdit.path === path && <InlineOverlay />}
+    </div>
+  );
+}
+
+/* ─────────────── Inline AI overlay (Ctrl+K) ─────────────── */
+
+function InlineOverlay() {
+  const edit = useStore((s) => s.inlineEdit)!;
+  const [instruction, setInstruction] = useState(edit.instruction);
+  const lines = useMemo(() => (edit.proposed !== null && edit.action !== "tests" ? diffLines(edit.original, edit.proposed) : []), [edit]);
+  const stats = diffStats(lines);
+
+  return (
+    <div className="absolute left-1/2 top-4 -translate-x-1/2 z-40 w-[560px] max-w-[94%] raised rounded-xl anim-fade-up" style={{ boxShadow: "var(--shadow)", borderColor: "var(--ember)" }}>
+      <div className="flex items-center gap-2 px-3 py-2 border-b border-[var(--line)]">
+        <Wand2 size={13} style={{ color: "var(--ember)" }} />
+        <span className="font-display font-semibold text-[12.5px]">Inline AI</span>
+        <span className="font-mono text-[10px] text-[var(--tx3)]">{edit.path}</span>
+        <div className="flex-1" />
+        {(["explain", "fix", "improve", "refactor", "tests"] as const).map((a) => (
+          <button key={a} className="chip !py-0.5 !text-[10px] cursor-pointer capitalize hover:text-[var(--ember)] hover:border-[var(--ember)]"
+            style={edit.action === a ? { color: "var(--ember)", borderColor: "var(--ember)" } : undefined}
+            onClick={() => void runInlineEdit(instruction, a)}>
+            {a}
+          </button>
+        ))}
+        <button className="p-1 text-[var(--tx3)] hover:text-[var(--tx)]" onClick={() => useStore.getState().setInlineEdit(null)}><X size={13} /></button>
+      </div>
+      <div className="p-3 space-y-2.5">
+        <div className="flex gap-1.5">
+          <input className="input !text-[12px]" placeholder='Instruction — e.g. "convert to TypeScript", "make it responsive"' value={instruction}
+            onChange={(e) => setInstruction(e.target.value)}
+            onKeyDown={(e) => { if (e.key === "Enter") void runInlineEdit(instruction, instruction.trim() ? "prompt" : edit.action); }}
+            autoFocus
+          />
+          <button className="btn btn-primary flex-none" onClick={() => void runInlineEdit(instruction, "prompt")} disabled={edit.status === "working"}>
+            {edit.status === "working" ? <Spinner size={12} /> : <Zap size={12} />}
+          </button>
+        </div>
+
+        {edit.status === "working" && (
+          <div className="flex items-center gap-2 text-[11.5px] text-[var(--tx2)] py-2"><Spinner size={12} /> thinking about {edit.original.split("\n").length} selected line(s)…</div>
+        )}
+
+        {edit.status === "ready" && edit.explanation && (
+          <div className="raised rounded-lg p-3 max-h-[240px] overflow-y-auto scroll-thin"><Markdown text={edit.explanation} /></div>
+        )}
+
+        {edit.status === "ready" && edit.proposed !== null && edit.action !== "tests" && (
+          <div>
+            <div className="flex items-center gap-2 mb-1 text-[10.5px]">
+              <span style={{ color: "var(--ok)" }}>+{stats.added}</span>
+              <span style={{ color: "var(--danger)" }}>−{stats.removed}</span>
+              <span className="text-[var(--tx3)]">proposed patch — nothing is written until you accept</span>
+            </div>
+            <div className="raised rounded-lg overflow-hidden max-h-[220px] overflow-y-auto scroll-thin font-mono text-[11px] leading-[1.55]">
+              {lines.map((l, i) => (
+                <div key={i} className={`flex whitespace-pre ${l.type === "add" ? "diff-add" : l.type === "del" ? "diff-del" : "diff-same"}`}>
+                  <span className="w-[22px] flex-none text-center select-none" style={{ color: l.type === "add" ? "var(--ok)" : l.type === "del" ? "var(--danger)" : "var(--tx3)" }}>
+                    {l.type === "add" ? "+" : l.type === "del" ? "−" : ""}
+                  </span>
+                  <span className="pr-3">{l.text}</span>
+                </div>
+              ))}
+            </div>
+          </div>
+        )}
+
+        {edit.status === "ready" && (edit.proposed !== null || edit.explanation) && (
+          <div className="flex gap-1.5 justify-end">
+            <button className="btn !py-1 !text-[11px]" onClick={() => void runInlineEdit(instruction, edit.action)}><Zap size={10} /> Regenerate</button>
+            <button className="btn btn-danger !py-1 !text-[11px]" onClick={() => useStore.getState().setInlineEdit(null)}><XCircle size={10} /> Reject</button>
+            {edit.proposed !== null && (
+              <button className="btn btn-ok !py-1 !text-[11px]" onClick={acceptInlineEdit}><Check size={10} /> {edit.action === "tests" ? "Accept test file" : "Accept patch"}</button>
+            )}
+          </div>
+        )}
+      </div>
     </div>
   );
 }
@@ -339,7 +468,7 @@ function ReportView() {
   if (!report) return null;
   return (
     <div className="h-full overflow-y-auto scroll-thin anim-fade">
-      <div className="max-w-[760px] raised rounded-xl my-4 mx-4 md:mx-auto p-6" style={{ background: "var(--bg1)" }}>
+      <div className="max-w-[760px] mx-auto p-6 raised rounded-xl my-4 mx-6 md:mx-auto" style={{ background: "var(--bg1)" }}>
         <Markdown text={report} />
       </div>
     </div>
